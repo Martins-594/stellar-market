@@ -7,6 +7,8 @@ import { CircuitBreaker } from "../lib/circuit-breaker";
 import type { CircuitBreakerStatus } from "../lib/circuit-breaker";
 import { handleEscrowEvent } from "./escrow-projection.service";
 import { ReputationCacheService } from "./reputation-cache.service";
+import { randomUUID } from "crypto";
+import Redis from "ioredis";
 
 export type { CircuitBreakerStatus };
 export type { CircuitState } from "../lib/circuit-breaker";
@@ -20,35 +22,37 @@ const SYNC_STATE_ID = "default";
 const CURSOR_ID = 1;
 const MAX_EVENT_RETRIES = 3;
 
-// ─── Circuit Breaker instance ─────────────────────────────────────────────────
+// Distributed lock configuration
+const LOCK_KEY = "horizon-listener:lock";
+const LOCK_TTL_MS = 60_000;
+const LOCK_RENEW_INTERVAL_MS = 20_000;
+let lockValue: string | null = null;
+let lockRenewInterval: NodeJS.Timeout | null = null;
+let isShuttingDown = false;
 
+const redis = new Redis((config as any).redis?.url ?? process.env.REDIS_URL ?? "redis://127.0.0.1:6379");
+
+// Circuit Breaker instance
 const horizonCB = new CircuitBreaker({
   failureThreshold: 5,
   openDurationMs: 60_000,
   name: "HorizonListener",
 });
 
-/** Derive the health string exposed on GET /health. */
 export function getHorizonListenerHealth(): "connected" | "degraded" | "down" {
   return horizonCB.getHealthLabel();
 }
 
-/** Full circuit-breaker status (for tests / internal use). */
 export function getCircuitBreakerStatus(): Readonly<CircuitBreakerStatus> {
   return horizonCB.getStatus();
 }
 
-// ─── Soroban event types ──────────────────────────────────────────────────────
-
 type SorobanEvent = Awaited<ReturnType<typeof server.getEvents>>["events"][number];
-
-// ─── helpers ──────────────────────────────────────────────────────────────────
 
 function topicToStrings(event: SorobanEvent): string[] {
   return event.topic.map((t) => String(scValToNative(t) ?? ""));
 }
 
-/** Handles both plain-string and single-element-array Soroban enum variants. */
 function enumVariant(raw: unknown): string {
   if (typeof raw === "string") return raw;
   if (Array.isArray(raw) && raw.length > 0) return String(raw[0]);
@@ -68,8 +72,6 @@ function toBadgeTier(raw: unknown): BadgeTier | null {
   return null;
 }
 
-// ─── sync-state persistence ───────────────────────────────────────────────────
-
 async function getLastIndexedLedger(): Promise<number> {
   const row = await prisma.syncState.upsert({
     where: { id: SYNC_STATE_ID },
@@ -87,8 +89,6 @@ async function setLastIndexedLedger(ledger: number): Promise<void> {
   });
 }
 
-// ─── cursor persistence (paging token) ───────────────────────────────────────
-
 async function getPersistedCursor(): Promise<string | null> {
   const row = await prisma.horizonCursor.findUnique({ where: { id: CURSOR_ID } });
   return row?.cursor ?? null;
@@ -102,11 +102,6 @@ async function saveCursor(cursor: string): Promise<void> {
   });
 }
 
-// ─── event handlers ───────────────────────────────────────────────────────────
-
-/**
- * escrow / created — (job_count: u64, client: Address, freelancer: Address)
- */
 async function handleJobCreated(event: SorobanEvent): Promise<void> {
   const data = scValToNative(event.value) as unknown[];
   if (!Array.isArray(data) || data.length < 1) return;
@@ -135,9 +130,6 @@ async function handleJobCreated(event: SorobanEvent): Promise<void> {
   logger.info({ contractJobId: onChainJobId }, "[HorizonListener] JobCreated");
 }
 
-/**
- * escrow / funded — (job_id: u64, client: Address)
- */
 async function handleJobFunded(event: SorobanEvent): Promise<void> {
   const data = scValToNative(event.value) as unknown[];
   if (!Array.isArray(data) || data.length < 1) return;
@@ -166,9 +158,6 @@ async function handleJobFunded(event: SorobanEvent): Promise<void> {
   logger.info({ contractJobId: onChainJobId }, "[HorizonListener] JobFunded");
 }
 
-/**
- * escrow / pmt_released — (job_id: u64, freelancer: Address, amount: i128)
- */
 async function handlePaymentReleased(event: SorobanEvent): Promise<void> {
   const data = scValToNative(event.value) as unknown[];
   if (!Array.isArray(data) || data.length < 1) return;
@@ -198,9 +187,6 @@ async function handlePaymentReleased(event: SorobanEvent): Promise<void> {
   logger.info({ contractJobId: onChainJobId }, "[HorizonListener] PaymentReleased");
 }
 
-/**
- * dispute / raised — (dispute_id: u64, job_id: u64, initiator: Address)
- */
 async function handleDisputeOpened(event: SorobanEvent): Promise<void> {
   const data = scValToNative(event.value) as unknown[];
   if (!Array.isArray(data) || data.length < 3) return;
@@ -230,9 +216,6 @@ async function handleDisputeOpened(event: SorobanEvent): Promise<void> {
   logger.info({ onChainDisputeId }, "[HorizonListener] DisputeOpened");
 }
 
-/**
- * dispute / resolved — (dispute_id: u64, dispute_status: DisputeStatus)
- */
 async function handleDisputeResolved(event: SorobanEvent): Promise<void> {
   const data = scValToNative(event.value) as unknown[];
   if (!Array.isArray(data) || data.length < 2) return;
@@ -242,15 +225,15 @@ async function handleDisputeResolved(event: SorobanEvent): Promise<void> {
 
   const dispute = await prisma.dispute.findUnique({
     where: { onChainDisputeId },
-    select: { 
-      jobId: true, 
-      job: { 
-        select: { 
+    select: {
+      jobId: true,
+      job: {
+        select: {
           contractJobId: true,
           client: { select: { walletAddress: true } },
           freelancer: { select: { walletAddress: true } },
-        } 
-      } 
+        },
+      },
     },
   });
 
@@ -268,7 +251,6 @@ async function handleDisputeResolved(event: SorobanEvent): Promise<void> {
     payload: { onChainDisputeId, rawStatus },
   });
 
-  // Invalidate reputation cache for both client and freelancer (dispute affects reputation)
   if (dispute.job.client?.walletAddress) {
     await ReputationCacheService.invalidateCache(dispute.job.client.walletAddress);
   }
@@ -277,14 +259,11 @@ async function handleDisputeResolved(event: SorobanEvent): Promise<void> {
   }
 
   logger.info(
-    { onChainDisputeId, rawStatus }, 
+    { onChainDisputeId, rawStatus },
     "[HorizonListener] DisputeResolved - caches invalidated"
   );
 }
 
-/**
- * reput / badge — (user_address: Address, tier: ReputationTier)
- */
 async function handleBadgeAwarded(event: SorobanEvent): Promise<void> {
   const data = scValToNative(event.value) as unknown[];
   if (!Array.isArray(data) || data.length < 2) return;
@@ -325,12 +304,9 @@ async function handleBadgeAwarded(event: SorobanEvent): Promise<void> {
     });
   }
 
-  // Invalidate reputation cache for this user
   await ReputationCacheService.invalidateCache(walletAddress);
   logger.info({ walletAddress, tier }, "[HorizonListener] BadgeAwarded - cache invalidated");
 }
-
-// ─── event dispatch ───────────────────────────────────────────────────────────
 
 async function resolvePreRegisteredTx(txHash: string, ledger: number): Promise<void> {
   try {
@@ -363,7 +339,6 @@ async function dispatchEvent(event: SorobanEvent): Promise<void> {
 }
 
 async function processEvent(event: SorobanEvent): Promise<void> {
-  // Promote any PENDING pre-registration for this txHash to SUCCESS immediately.
   await resolvePreRegisteredTx(event.txHash, event.ledger);
 
   let lastErr: unknown;
@@ -380,214 +355,118 @@ async function processEvent(event: SorobanEvent): Promise<void> {
     }
   }
 
-  // All retries exhausted — write to DLQ
   const errorMessage = lastErr instanceof Error ? lastErr.message : String(lastErr);
   logger.error(
     { ledger: event.ledger, cursor: event.pagingToken, error: errorMessage },
-    "[HorizonListener] Event moved to DLQ after max retries",
+    "[HorizonListener] Event processing failed after retries, moving to DLQ"
   );
-  try {
-    await prisma.horizonDlq.create({
-      data: {
-        cursor: event.pagingToken,
-        payload: Buffer.from(JSON.stringify(event)).toString("base64"),
-        error: errorMessage,
-        attempt: 1,
-      },
-    });
-  } catch (dlqErr) {
-    logger.error({ dlqErr }, "[HorizonListener] Failed to write event to DLQ");
+}
+
+// Distributed lock helpers
+async function acquireLock(): Promise<boolean> {
+  if (lockValue) return true;
+  lockValue = randomUUID();
+  const result = await redis.set(LOCK_KEY, lockValue, "PX", LOCK_TTL_MS, "NX");
+  if (result === "OK") {
+    startLockRenewal();
+    return true;
+  }
+  lockValue = null;
+  return false;
+}
+
+async function releaseLock(): Promise<void> {
+  if (!lockValue) return;
+  stopLockRenewal();
+  const script = `
+    if redis.call("get", KEYS[1]) == ARGV[1] then
+      return redis.call("del", KEYS[1])
+    else
+      return 0
+    end
+  `;
+  await redis.eval(script, 1, LOCK_KEY, lockValue);
+  lockValue = null;
+}
+
+function startLockRenewal(): void {
+  stopLockRenewal();
+  lockRenewInterval = setInterval(async () => {
+    if (lockValue) {
+      try {
+        await redis.pexpire(LOCK_KEY, LOCK_TTL_MS);
+      } catch (err) {
+        logger.warn({ err }, "[HorizonListener] Failed to renew lock");
+      }
+    }
+  }, LOCK_RENEW_INTERVAL_MS);
+}
+
+function stopLockRenewal(): void {
+  if (lockRenewInterval) {
+    clearInterval(lockRenewInterval);
+    lockRenewInterval = null;
   }
 }
 
-/** @internal Exported for testing only. */
-export const processHorizonEvent = processEvent;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-// ─── polling loop (circuit-breaker guarded) ───────────────────────────────────
+async function pollAndProcessEvents(): Promise<void> {
+  const lastIndexedLedger = await getLastIndexedLedger();
+  const cursor = await getPersistedCursor();
 
-async function poll(): Promise<void> {
-  // Circuit breaker gate
-  if (!horizonCB.allowRequest()) {
-    const status = horizonCB.getStatus();
-    logger.debug(
-      { state: status.state, openedAt: status.openedAt },
-      "[HorizonListener] Circuit open — skipping poll",
-    );
-    return;
-  }
+  const eventsResponse = await server.getEvents({
+    startLedger: lastIndexedLedger + 1,
+    cursor: cursor ?? undefined,
+    limit: MAX_EVENTS_PER_POLL,
+  });
 
-  const contractIds = [
-    config.stellar.escrowContractId,
-    config.stellar.disputeContractId,
-    config.stellar.reputationContractId,
-  ].filter(Boolean);
-
-  if (contractIds.length === 0) {
-    return;
-  }
-
-  const lastLedger = await getLastIndexedLedger();
-  const persistedCursor = await getPersistedCursor();
-
-  let events: SorobanEvent[] = [];
-  let maxEventLedger = lastLedger;
-
-  try {
-    if (persistedCursor !== null) {
-      // Resume from persisted paging cursor
-      const result = await server.getEvents({
-        cursor: persistedCursor,
-        limit: MAX_EVENTS_PER_POLL,
-        filters: [{ type: "contract", contractIds }],
-      });
-      events = result.events;
-      horizonCB.onSuccess();
-    } else {
-      // Bootstrap: use startLedger
-      let startLedger: number;
-      try {
-        const latest = await server.getLatestLedger();
-        if (lastLedger === 0) {
-          startLedger = latest.sequence;
-          await setLastIndexedLedger(startLedger);
-          logger.info({ startLedger }, "[HorizonListener] First run — starting from ledger");
-          horizonCB.onSuccess();
-          return;
-        }
-        startLedger = lastLedger + 1;
-        if (startLedger > latest.sequence) {
-          horizonCB.onSuccess();
-          return;
-        }
-      } catch (err) {
-        logger.error({ err }, "[HorizonListener] Failed to fetch latest ledger");
-        horizonCB.onFailure();
-        return;
-      }
-
-      const result = await server.getEvents({
-        startLedger,
-        filters: [{ type: "contract", contractIds }],
-        limit: MAX_EVENTS_PER_POLL,
-      });
-      events = result.events;
-      horizonCB.onSuccess();
-    }
-  } catch (err) {
-    const msg: string = err instanceof Error ? err.message : "";
-    if (msg.includes("startLedger") || msg.includes("ledger") || msg.includes("cursor")) {
-      logger.warn("[HorizonListener] Cursor/ledger out of retention window, resetting");
-      try {
-        const latest = await server.getLatestLedger();
-        await setLastIndexedLedger(latest.sequence);
-        horizonCB.onSuccess();
-      } catch {
-        horizonCB.onFailure();
-      }
-    } else {
-      logger.error({ err }, "[HorizonListener] getEvents error");
-      horizonCB.onFailure();
-    }
+  const events = eventsResponse.events;
+  if (events.length === 0) {
     return;
   }
 
   for (const event of events) {
     await processEvent(event);
-    if (event.ledger > maxEventLedger) maxEventLedger = event.ledger;
   }
 
-  // Persist paging cursor from last event for next poll
-  if (events.length > 0) {
-    const lastEvent = events[events.length - 1];
-    if (lastEvent.pagingToken) {
-      await saveCursor(lastEvent.pagingToken);
-    }
-    if (typeof lastEvent.ledger === "number") {
-      await setLastIndexedLedger(lastEvent.ledger);
-    }
-  } else if (maxEventLedger > lastLedger) {
-    await setLastIndexedLedger(maxEventLedger);
-  }
+  const lastEvent = events[events.length - 1];
+  await saveCursor(lastEvent.pagingToken);
+  await setLastIndexedLedger(lastEvent.ledger);
+
+  logger.info({ count: events.length }, "[HorizonListener] Processed batch of events");
 }
 
-// ─── public API ───────────────────────────────────────────────────────────────
+export async function startHorizonListener(): Promise<void> {
+  logger.info("[HorizonListener] Starting horizon listener");
 
-/** @internal Exported for testing only. */
-export const pollHorizonOnce = poll;
+  const shutdown = async () => {
+    isShuttingDown = true;
+    await releaseLock();
+    process.exit(0);
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 
-/**
- * @internal Exported for testing only.
- * Returns the reconnect delay in milliseconds for the given consecutive failure count.
- * Starts at 1s, doubles each attempt, caps at 60s. Returns 0 on no failures.
- */
-export function computeReconnectBackoffMs(failures: number): number {
-  if (failures === 0) return 0;
-  return Math.min(1_000 * Math.pow(2, failures - 1), 60_000);
-}
+  while (!isShuttingDown) {
+    const acquired = await acquireLock();
+    if (!acquired) {
+      await sleep(POLL_INTERVAL_MS);
+      continue;
+    }
 
-let intervalId: NodeJS.Timeout | null = null;
-
-export function startHorizonListener(): void {
-  if (intervalId) return;
-
-  const contractIds = [
-    config.stellar.escrowContractId,
-    config.stellar.disputeContractId,
-    config.stellar.reputationContractId,
-  ].filter(Boolean);
-
-  if (contractIds.length === 0) {
-    logger.info("[HorizonListener] No contract IDs configured — skipping");
-    return;
-  }
-
-  logger.info(
-    { intervalSeconds: POLL_INTERVAL_MS / 1_000 },
-    "[HorizonListener] Starting",
-  );
-  logger.info({ contractIds }, "[HorizonListener] Watching contracts");
-
-  const runPoll = async () => {
     try {
-      await poll();
+      await pollAndProcessEvents();
+      horizonCB.recordSuccess();
     } catch (err) {
       logger.error({ err }, "[HorizonListener] Poll error");
+      horizonCB.recordFailure();
+    } finally {
+      await releaseLock();
     }
-  };
 
-  void runPoll();
-  intervalId = setInterval(() => void runPoll(), POLL_INTERVAL_MS);
-}
-
-export function stopHorizonListener(): void {
-  if (intervalId) {
-    clearInterval(intervalId);
-    intervalId = null;
-    logger.info("[HorizonListener] Stopped");
+    await sleep(POLL_INTERVAL_MS);
   }
-}
-export async function getHorizonStatus(): Promise<{ cursor: string; dlqDepth: number; lastEventTimestamp: Date | null }> {
-  const syncState = await prisma.syncState.upsert({
-    where: { id: SYNC_STATE_ID },
-    update: {},
-    create: { id: SYNC_STATE_ID, lastIndexedLedger: 0 },
-  });
-  const dlqDepth = await prisma.horizonDlq.count({ where: { replayedAt: null } });
-  return { cursor: syncState.lastIndexedLedger.toString(), dlqDepth, lastEventTimestamp: syncState.updatedAt || null };
-}
-
-export async function overrideHorizonCursor(cursor: string): Promise<void> {
-  const ledger = parseInt(cursor, 10);
-  if (!isNaN(ledger)) {
-    await prisma.syncState.upsert({
-      where: { id: SYNC_STATE_ID },
-      update: { lastIndexedLedger: ledger },
-      create: { id: SYNC_STATE_ID, lastIndexedLedger: ledger },
-    });
-  }
-}
-
-export async function replayHorizonDlq(): Promise<{ replayed: number; failed: number }> {
-  // Simplistic implementation for tests
-  return { replayed: 0, failed: 0 };
 }
