@@ -443,6 +443,24 @@ fn bump_pending_resolution_ttl(env: &Env, dispute_id: u64) {
     );
 }
 
+/// Every other `bump_*_ttl` helper extends only when the entry's remaining
+/// TTL has fallen below `MIN_TTL_THRESHOLD`, because that key gets touched
+/// repeatedly over a dispute's lifetime and each touch is another chance to
+/// refresh it. `ExclusionProposal` has no such second chance: it exists for
+/// exactly one write (this call) and is either confirmed and removed, or
+/// never touched again. A fresh persistent entry's ledger-assigned baseline
+/// TTL already exceeds `MIN_TTL_THRESHOLD`, so extending with that same
+/// threshold here would be a guaranteed no-op on the very write meant to
+/// protect it — passing `MIN_TTL_EXTEND_TO` as the threshold instead forces
+/// the extension to actually take effect immediately (#1166).
+fn bump_exclusion_proposal_ttl(env: &Env, dispute_id: u64, voter: &Address) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::ExclusionProposal(dispute_id, voter.clone()),
+        MIN_TTL_EXTEND_TO,
+        MIN_TTL_EXTEND_TO,
+    );
+}
+
 /// Creates a default (zeroed) DisputeTally for a new dispute.
 fn new_tally() -> DisputeTally {
     DisputeTally {
@@ -1268,6 +1286,12 @@ impl DisputeContract {
         let proposer: Option<Address> = env.storage().persistent().get(&proposal_key);
         if proposer.is_none() {
             env.storage().persistent().set(&proposal_key, &caller);
+            // Every other persistent key in this contract gets its TTL
+            // extended on write — an exclusion proposal awaiting the second
+            // party's confirmation is no different, and without this it
+            // could expire from storage before that confirmation ever
+            // happens (#1166).
+            bump_exclusion_proposal_ttl(&env, dispute_id, &voter);
             return Ok(());
         }
         if proposer == Some(caller) {
