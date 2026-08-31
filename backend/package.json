@@ -4,9 +4,9 @@
   "description": "StellarMarket decentralized freelance marketplace backend API",
   "main": "dist/index.js",
   "scripts": {
-    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "build": "tsc",
-    "start": "node dist/index.js",
+    "dev": "node api.js && ts-node-dev --respawn --transpile-only src/index.ts",
+    "build": "node api.js && tsc",
+    "start": "node api.js && node dist/index.js",
     "lint": "eslint 'src/**/*.ts' --max-warnings=0",
     "test": "jest --runInBand --forceExit",
     "prisma:generate": "prisma generate",
