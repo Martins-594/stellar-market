@@ -658,6 +658,20 @@ fn execute_after_grace_is_refused_then_expirable() {
 // ============================================================
 
 #[test]
+fn get_governance_config_returns_configured_values() {
+    let ctx = setup();
+
+    let config = ctx.escrow.get_governance_config().unwrap();
+    assert_eq!(config.reputation, ctx.rep_id);
+    assert_eq!(config.voting_period_secs, VOTING_PERIOD);
+    assert_eq!(config.timelock_secs, TIMELOCK);
+    assert_eq!(config.grace_secs, GRACE);
+    assert_eq!(config.quorum_votes, QUORUM);
+    assert_eq!(config.pass_threshold_bps, PASS_BPS);
+    assert_eq!(config.min_proposer_weight, 0);
+}
+
+#[test]
 fn propose_requires_governance_configured() {
     let env = Env::default();
     env.mock_all_auths();
