@@ -309,7 +309,7 @@ fn test_create_job_empty_milestones() {
 }
 
 #[test]
-#[should_panic(expected = "HostError: Error(Contract, #48)")] // TooManyMilestones
+#[should_panic(expected = "HostError: Error(Contract, #34)")] // TooManyMilestones
 fn test_create_job_too_many_milestones() {
     let env = Env::default();
     env.mock_all_auths();
@@ -477,6 +477,44 @@ fn test_extend_deadline() {
 
     let job = client.get_job(&job_id);
     assert_eq!(job.milestones.get(0).unwrap().deadline, 4000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")] // InvalidStatus
+fn test_extend_deadline_fails_when_disputed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let contract_id = env.register_contract(None, EscrowContract);
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let milestones = vec![&env, (String::from_str(&env, "Task 1"), 100_i128, 2000_u64)];
+
+    let job_id = client.create_job(
+        &user,
+        &freelancer,
+        &token,
+        &milestones,
+        &3000_u64,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+
+    // Force the job into Disputed state
+    env.as_contract(&client.address, || {
+        let key = crate::DataKey::Job(job_id);
+        let mut job: crate::Job = env.storage().persistent().get(&key).unwrap();
+        job.status = JobStatus::Disputed;
+        env.storage().persistent().set(&key, &job);
+    });
+
+    // Must be rejected with InvalidStatus (#3)
+    client.extend_deadline(&job_id, &0, &4000_u64);
 }
 
 // ── Helpers for claim_refund tests ───────────────────────────────────────────
@@ -1343,7 +1381,7 @@ fn test_propose_revision_fails_when_pending_proposal_exists() {
 }
 
 #[test]
-#[should_panic(expected = "HostError: Error(Contract, #48)")] // TooManyMilestones
+#[should_panic(expected = "HostError: Error(Contract, #34)")] // TooManyMilestones
 fn test_propose_revision_too_many_milestones() {
     let env = Env::default();
     env.mock_all_auths();
@@ -2068,6 +2106,115 @@ fn test_resolve_dispute_callback_refund_both() {
     let token_client = TokenClient::new(&env, &token);
     assert_eq!(token_client.balance(&client), each);
     assert_eq!(token_client.balance(&freelancer), each);
+}
+
+// ── #1178 — Escalate leaves the job parked in Disputed ────────────────────────
+//
+// These lock the behaviour now documented on `JobStatus` under "Escalated
+// disputes": Escalate is a self-loop that moves no funds, and the job leaves
+// Disputed only via a later resolution or via expire_job.
+
+/// Helper: create + fund a single-milestone job and drive it into Disputed
+/// through the registered dispute contract. Returns (job_id, amount).
+fn setup_disputed_job(
+    env: &Env,
+    escrow: &EscrowContractClient<'_>,
+    client: &Address,
+    freelancer: &Address,
+    token: &Address,
+    admin: &Address,
+) -> (u64, i128) {
+    let amount: i128 = 1000;
+    let milestones = vec![
+        env,
+        (String::from_str(env, "Task 1"), amount, JOB_DEADLINE),
+    ];
+    let job_id = escrow.create_job(
+        client,
+        freelancer,
+        token,
+        &milestones,
+        &JOB_DEADLINE,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+    escrow.fund_job(&job_id, client, &0, &0);
+
+    let dispute_contract = Address::generate(env);
+    escrow.set_dispute_contract(admin, &dispute_contract);
+    escrow.mark_job_disputed(&job_id, &1_u64);
+
+    (job_id, amount)
+}
+
+#[test]
+fn test_resolve_dispute_callback_escalate_keeps_job_disputed_and_funds_escrowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (escrow, client, freelancer, token, admin) = setup_test(&env);
+    let (job_id, amount) = setup_disputed_job(&env, &escrow, &client, &freelancer, &token, &admin);
+
+    let token_client = TokenClient::new(&env, &token);
+    let client_before = token_client.balance(&client);
+    let freelancer_before = token_client.balance(&freelancer);
+
+    escrow.resolve_dispute_callback(&job_id, &DisputeResolution::Escalate);
+
+    // Self-loop: status is untouched and the escrow still holds the full amount.
+    let job = escrow.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Disputed);
+    assert_eq!(token_client.balance(&escrow.address), amount);
+    assert_eq!(token_client.balance(&client), client_before);
+    assert_eq!(token_client.balance(&freelancer), freelancer_before);
+}
+
+#[test]
+fn test_escalated_job_can_be_resolved_by_a_later_callback() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (escrow, client, freelancer, token, admin) = setup_test(&env);
+    let (job_id, amount) = setup_disputed_job(&env, &escrow, &client, &freelancer, &token, &admin);
+
+    // Escalate twice — re-callable, still no settlement.
+    escrow.resolve_dispute_callback(&job_id, &DisputeResolution::Escalate);
+    escrow.resolve_dispute_callback(&job_id, &DisputeResolution::Escalate);
+    assert_eq!(escrow.get_job(&job_id).status, JobStatus::Disputed);
+
+    // The higher tier finally rules: the job settles with the escrow intact.
+    escrow.resolve_dispute_callback(&job_id, &DisputeResolution::FreelancerWins);
+
+    let job = escrow.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Completed);
+
+    let token_client = TokenClient::new(&env, &token);
+    assert_eq!(token_client.balance(&freelancer), amount);
+}
+
+#[test]
+fn test_escalated_job_can_still_expire_after_deadline() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (escrow, client, freelancer, token, admin) = setup_test(&env);
+    let (job_id, amount) = setup_disputed_job(&env, &escrow, &client, &freelancer, &token, &admin);
+
+    let token_client = TokenClient::new(&env, &token);
+    let client_before = token_client.balance(&client);
+
+    escrow.resolve_dispute_callback(&job_id, &DisputeResolution::Escalate);
+
+    // Backstop path: nobody re-resolves, the deadline passes, anyone can expire it.
+    env.ledger().with_mut(|l| l.timestamp = JOB_DEADLINE + 1);
+    escrow.expire_job(&job_id);
+
+    let job = escrow.get_job(&job_id);
+    assert_eq!(job.status, JobStatus::Expired);
+    assert_eq!(token_client.balance(&client), client_before + amount);
 }
 
 // ── Pause mechanism tests ─────────────────────────────────────────────────────
@@ -8121,4 +8268,44 @@ fn test_accept_revision_sub_assign_unchanged_on_milestone_growth() {
 
     assert_eq!(tc.balance(&sub_freelancer) - sub_before, 400);
     assert_eq!(tc.balance(&freelancer) - fl_before, 2_000 - 400);
+}
+
+// ─── #1156: get_price_oracle coverage ─────────────────────────────────────────
+
+#[test]
+fn test_get_price_oracle_unset_returns_none() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract, _client, _freelancer, _token, _admin) = setup_test(&env);
+
+    // Fresh contract — no oracle configured yet
+    assert!(contract.get_price_oracle().is_none());
+}
+
+#[test]
+fn test_get_price_oracle_returns_set_address() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract, _client, _freelancer, _token, admin) = setup_test(&env);
+
+    let oracle = Address::generate(&env);
+    contract.set_price_oracle(&admin, &oracle);
+
+    assert_eq!(contract.get_price_oracle(), Some(oracle));
+}
+
+#[test]
+fn test_set_price_oracle_overwrites_previous_value() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (contract, _client, _freelancer, _token, admin) = setup_test(&env);
+
+    let oracle_first = Address::generate(&env);
+    let oracle_second = Address::generate(&env);
+
+    contract.set_price_oracle(&admin, &oracle_first);
+    assert_eq!(contract.get_price_oracle(), Some(oracle_first));
+
+    contract.set_price_oracle(&admin, &oracle_second);
+    assert_eq!(contract.get_price_oracle(), Some(oracle_second));
 }

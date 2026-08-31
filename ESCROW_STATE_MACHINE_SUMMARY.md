@@ -136,13 +136,47 @@ The implementation is complete and ready for:
                                │
                    resolve_dispute_callback
                                │
-                   ┌───────────┴───────────┐
-                   ▼                       ▼
-             ┌───────────┐           ┌───────────┐
-             │ Completed │           │ Cancelled │
-             └───────────┘           └───────────┘
+                   ┌───────────┼───────────────────────┐
+                   │           │                       │
+         FreelancerWins    ClientWins /            Escalate
+                   │       RefundBoth /                 │
+                   │       RefundSplit /       (status unchanged —
+                   │       MaliciousFiling      job stays Disputed,
+                   │           │                no funds moved)
+                   ▼           ▼                        │
+             ┌───────────┐ ┌───────────┐                │
+             │ Completed │ │ Cancelled │ <──────────────┘
+             └───────────┘ └───────────┘   a later resolve_dispute_callback
+                   ▲                       with a final resolution
+                   │
+                   └── (or expire_job once the deadline passes ──> Expired)
 ```
+
+## Escalated Disputes
+
+`DisputeResolution::Escalate` is the only resolution that does not settle a job. It
+moves no funds and leaves the job's status untouched, so a disputed job stays
+**Disputed** while continuing to hold the full escrowed balance — a self-loop, not a
+terminal transition. The `("escrow", "dispute")` event is still emitted carrying
+`Escalate`, which is the signal for the dispute contract's higher arbitration tier;
+the escrow contract itself keeps no escalation queue or timer and will not move the
+job on by itself.
+
+An escalated job leaves **Disputed** in one of two externally driven ways:
+
+1. **Re-resolution (expected path)** — the dispute contract calls
+   `resolve_dispute_callback` again with a final resolution. `require_state_disputable`
+   accepts `Disputed` as an input state, so an escalated job can be resolved again
+   until a non-`Escalate` resolution settles it. Remaining balances are recomputed at
+   that point, so escalating first loses no funds.
+2. **Expiry (backstop)** — after `job_deadline` passes, anyone may call `expire_job`;
+   only terminal states are rejected, so a **Disputed** job is expirable. Approved
+   milestones are paid to the freelancer, the remainder is refunded to the client, and
+   the job becomes **Expired**.
 
 ## Terminal States
 
 Once a job reaches **Completed**, **Cancelled**, or **Expired** state, it cannot transition to any other state. All mutation operations will fail with `InvalidStatus` error (#3).
+
+**Disputed is not terminal.** It can still transition to Completed/Cancelled (via a
+further `resolve_dispute_callback`) or to Expired (via `expire_job`).
