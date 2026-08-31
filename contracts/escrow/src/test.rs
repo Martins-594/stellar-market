@@ -8701,3 +8701,84 @@ fn test_remove_signer_below_threshold_still_rejected() {
     assert_eq!(res, Err(Ok(EscrowError::InvalidThreshold)));
     assert_eq!(current_signers(&env, &contract).len(), 2);
 }
+
+// ── Issue #1158: bump_escrow must actually extend the job's TTL ──────────────
+
+#[test]
+fn test_bump_escrow_extends_job_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| {
+        l.timestamp = 1000;
+        l.sequence_number = 1;
+    });
+
+    let (contract, client, freelancer, token, _admin) = setup_test(&env);
+    let milestones = vec![&env, (String::from_str(&env, "Work"), 1000_i128, JOB_DEADLINE)];
+    let job_id = contract.create_job(
+        &client, &freelancer, &token, &milestones, &JOB_DEADLINE, &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+
+    let key = crate::DataKey::Job(job_id);
+
+    // Let a large part of the original TTL burn down before bumping.
+    env.ledger().with_mut(|l| l.sequence_number = 400_000);
+    let ttl_before =
+        env.as_contract(&contract.address, || env.storage().persistent().get_ttl(&key));
+
+    contract.bump_escrow(&job_id);
+
+    let ttl_after =
+        env.as_contract(&contract.address, || env.storage().persistent().get_ttl(&key));
+
+    assert!(
+        ttl_after > ttl_before,
+        "bump_escrow should extend the TTL (before: {}, after: {})",
+        ttl_before,
+        ttl_after
+    );
+    assert_eq!(
+        ttl_after,
+        crate::ESCROW_TTL_LEDGERS,
+        "bump_escrow should extend the job key to the full escrow TTL"
+    );
+}
+
+#[test]
+fn test_bump_escrow_keeps_job_readable_past_its_original_ttl() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| {
+        l.timestamp = 1000;
+        l.sequence_number = 1;
+    });
+
+    let (contract, client, freelancer, token, _admin) = setup_test(&env);
+    let milestones = vec![&env, (String::from_str(&env, "Work"), 1000_i128, JOB_DEADLINE)];
+    let job_id = contract.create_job(
+        &client, &freelancer, &token, &milestones, &JOB_DEADLINE, &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+
+    // Bump partway through the original window, then advance past where the
+    // entry would have been archived had the bump not taken effect.
+    env.ledger().with_mut(|l| l.sequence_number = 400_000);
+    contract.bump_escrow(&job_id);
+    env.ledger().with_mut(|l| l.sequence_number = 700_000);
+
+    let job = contract.get_job(&job_id);
+    assert_eq!(job.id, job_id);
+}
+
+#[test]
+fn test_bump_escrow_unknown_job_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let (contract, _, _, _, _admin) = setup_test(&env);
+
+    let res = contract.try_bump_escrow(&999u64);
+    assert_eq!(res, Err(Ok(EscrowError::JobNotFound)));
+}
