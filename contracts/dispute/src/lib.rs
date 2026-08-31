@@ -318,6 +318,17 @@ const APPEAL_WINDOW_SECS: u64 = 172_800; // 48 hours
 /// Minimum votes required to resolve an appeal.
 const APPEAL_MIN_VOTES: u32 = 3;
 
+/// Minimum total votes before a MaliciousFiling determination can trigger
+/// (issue #1169). Below this, the ratio check alone could fire on a single
+/// stray vote (e.g. 1/1 = 100%).
+const MALICIOUS_FILING_MIN_VOTES: u32 = 5;
+/// Numerator of the malicious-filing supermajority ratio: requires
+/// `votes_for_malicious * MALICIOUS_FILING_SUPERMAJORITY_NUM >=
+/// total_votes * MALICIOUS_FILING_SUPERMAJORITY_DENOM`, i.e. ≥ 4/5 (80%).
+const MALICIOUS_FILING_SUPERMAJORITY_NUM: u32 = 4;
+/// Denominator of the malicious-filing supermajority ratio (see above).
+const MALICIOUS_FILING_SUPERMAJORITY_DENOM: u32 = 5;
+
 const NONCE_EXPIRY_LEDGERS: u32 = 3;
 
 /// Production TTL sizing for dispute-related storage, based on Stellar's
@@ -458,6 +469,24 @@ fn bump_pending_resolution_ttl(env: &Env, dispute_id: u64) {
     env.storage().persistent().extend_ttl(
         &DataKey::PendingResolution(dispute_id),
         MIN_TTL_THRESHOLD,
+        MIN_TTL_EXTEND_TO,
+    );
+}
+
+/// Every other `bump_*_ttl` helper extends only when the entry's remaining
+/// TTL has fallen below `MIN_TTL_THRESHOLD`, because that key gets touched
+/// repeatedly over a dispute's lifetime and each touch is another chance to
+/// refresh it. `ExclusionProposal` has no such second chance: it exists for
+/// exactly one write (this call) and is either confirmed and removed, or
+/// never touched again. A fresh persistent entry's ledger-assigned baseline
+/// TTL already exceeds `MIN_TTL_THRESHOLD`, so extending with that same
+/// threshold here would be a guaranteed no-op on the very write meant to
+/// protect it — passing `MIN_TTL_EXTEND_TO` as the threshold instead forces
+/// the extension to actually take effect immediately (#1166).
+fn bump_exclusion_proposal_ttl(env: &Env, dispute_id: u64, voter: &Address) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::ExclusionProposal(dispute_id, voter.clone()),
+        MIN_TTL_EXTEND_TO,
         MIN_TTL_EXTEND_TO,
     );
 }
@@ -1287,6 +1316,12 @@ impl DisputeContract {
         let proposer: Option<Address> = env.storage().persistent().get(&proposal_key);
         if proposer.is_none() {
             env.storage().persistent().set(&proposal_key, &caller);
+            // Every other persistent key in this contract gets its TTL
+            // extended on write — an exclusion proposal awaiting the second
+            // party's confirmation is no different, and without this it
+            // could expire from storage before that confirmation ever
+            // happens (#1166).
+            bump_exclusion_proposal_ttl(&env, dispute_id, &voter);
             return Ok(());
         }
         if proposer == Some(caller) {
@@ -2347,9 +2382,12 @@ fn internal_resolve(
     }
 
     // ── Supermajority check: MaliciousFiling requires 4 out of every 5 votes ─────
-    // votes_for_malicious * 5 >= total_votes * 4  ↔  ≥ 80 % of all votes
-    let is_malicious_supermajority = total_votes >= 5
-        && dispute.votes_for_malicious.saturating_mul(5) >= total_votes.saturating_mul(4);
+    // votes_for_malicious * NUM >= total_votes * DENOM  ↔  ≥ 80 % of all votes
+    let is_malicious_supermajority = total_votes >= MALICIOUS_FILING_MIN_VOTES
+        && dispute
+            .votes_for_malicious
+            .saturating_mul(MALICIOUS_FILING_SUPERMAJORITY_DENOM)
+            >= total_votes.saturating_mul(MALICIOUS_FILING_SUPERMAJORITY_NUM);
 
     if is_malicious_supermajority {
         dispute.status = DisputeStatus::MaliciousDisputeFiling;

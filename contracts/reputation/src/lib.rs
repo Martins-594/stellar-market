@@ -1,4 +1,36 @@
 #![no_std]
+//! # Reputation contract
+//!
+//! ## Two distinct measures of standing (issue #1172)
+//!
+//! This contract exposes **two independent ladders**. They are computed from
+//! different inputs, answer different questions, and routinely disagree — a user
+//! can sit at the top of one and the bottom of the other. They are deliberately
+//! named apart so they are not mistaken for the same thing:
+//!
+//! | | **Rating tier** ([`ReputationTier`]) | **Score badge** ([`ScoreBadge`]) |
+//! |---|---|---|
+//! | Read via | [`ReputationContract::get_tier`] | [`ReputationContract::get_score_badge`] |
+//! | Computed from | `average_rating` = decayed `total_score / total_weight × 100`, multiplied by the user's stake multiplier and capped at 10,000 | raw decayed `total_score` = Σ(`rating` × per-review `stake_weight`) |
+//! | Grows with review count? | **No** — it is an average, so a 5★ user with 1 review ranks alongside a 5★ user with 100 | **Yes** — every additional review and every additional staked unit pushes it up without bound |
+//! | Rungs | None / Bronze (≥100) / Silver (≥300) / Gold (≥500) / Platinum (≥700) | None / Rising (≥100) / Established (≥500) / Elite (≥2000) |
+//! | Answers | "how well does this user perform?" | "how much proven, stake-backed history does this user have?" |
+//!
+//! Consequences worth knowing before integrating:
+//!
+//! - The two ladders have **different numbers of rungs and different thresholds**;
+//!   they are not parallel and are not meant to be. There is no "Platinum" score
+//!   badge, and a `Gold` rating tier implies nothing about the score badge.
+//! - The ladders share only the word "reputation". Do not map one onto the other,
+//!   and do not present them to users as one combined level.
+//! - [`ReputationContract::get_badges`] is a *third* thing again: it returns the
+//!   **rating tiers** ([`AwardedBadge::badge_type`] is a [`ReputationTier`]) that a
+//!   user has passed through and permanently keeps, whereas the rating tier and the
+//!   score badge are both computed live and can fall as reviews decay.
+//! - Both ladders read decayed values, so both drift downward while a user is
+//!   dormant.
+//!
+//! `get_badge` is retained as a backwards-compatible alias of `get_score_badge`.
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, String,
@@ -129,7 +161,7 @@ pub enum ReputationError {
     /// Rejected when `set_stake_tiers` is called with more tiers than
     /// `MAX_STAKE_TIERS`. An unbounded tier list would make every call to
     /// `get_stake_multiplier` (on the hot path for `get_average_rating`,
-    /// `get_badge`, and leaderboard updates) progressively more expensive,
+    /// `get_score_badge`, and leaderboard updates) progressively more expensive,
     /// mirroring the cap pattern used for `MAX_ENDORSERS_COUNTED`,
     /// `MAX_REVIEWS_COUNTED`, and `MAX_REVIEWS_PER_REVIEWEE_WINDOW` (issue #1177).
     TooManyStakeTiers = 30,
@@ -185,6 +217,14 @@ pub struct ReferralBonusRecord {
     pub timestamp: u64,
 }
 
+/// **Rating tier** — a user's standing on the *quality* ladder, derived from
+/// `average_rating` (see [`ReputationContract::get_tier`]). Independent of how many
+/// reviews a user has: it is an average, so one glowing review can reach the same
+/// tier as a hundred. Not to be confused with [`ScoreBadge`], the *volume* ladder —
+/// see the module docs for the full comparison (issue #1172).
+///
+/// Thresholds on `average_rating` (0–10,000): Bronze ≥ 100, Silver ≥ 300,
+/// Gold ≥ 500, Platinum ≥ 700.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -196,14 +236,28 @@ pub enum ReputationTier {
     Platinum = 4,
 }
 
+/// **Score badge** — a user's standing on the *volume* ladder, derived from the raw
+/// decayed `total_score` (see [`ReputationContract::get_score_badge`]). It rises
+/// with every additional review and with the stake backing those reviews, so it
+/// measures accumulated, stake-backed history rather than quality.
+///
+/// Deliberately named apart from [`ReputationTier`] (issue #1172): the two ladders
+/// use different inputs and thresholds and frequently disagree. The rungs are
+/// intentionally not parallel to the rating tiers — there is no Platinum here, and
+/// `Elite` is the top of a three-rung ladder.
+///
+/// Thresholds on the decayed `total_score`: Rising ≥ 100, Established ≥ 500,
+/// Elite ≥ 2000. Discriminants match the previous `Badge` enum, so encoded values
+/// are unchanged: `Rising` was `Bronze`, `Established` was `Silver`, `Elite` was
+/// `Gold`.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
-pub enum Badge {
+pub enum ScoreBadge {
     None = 0,
-    Bronze = 1,
-    Silver = 2,
-    Gold = 3,
+    Rising = 1,
+    Established = 2,
+    Elite = 3,
 }
 
 #[contracttype]
@@ -215,9 +269,17 @@ pub enum DisputeOutcome {
     MaliciousFiling = 2,
 }
 
+/// A **rating tier** the user has reached at least once, kept permanently.
+///
+/// Despite the name, this has nothing to do with [`ScoreBadge`]: `badge_type` is a
+/// [`ReputationTier`], awarded by `submit_review` when a user first crosses a tier
+/// threshold. Unlike the two live ladders it never falls back — decay can lower a
+/// user's current tier and score badge while these awarded records stay (issue
+/// #1172).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AwardedBadge {
+    /// The rating tier that was reached — **not** a [`ScoreBadge`].
     pub badge_type: ReputationTier,
     pub awarded_at: u64,
 }
@@ -432,7 +494,7 @@ const MAX_REVIEWS_COUNTED: u32 = 200;
 const MAX_REVIEWS_PER_REVIEWEE_WINDOW: u32 = 20;
 // Bounds how many stake tiers `set_stake_tiers` accepts. `get_stake_multiplier`
 // iterates the full tier list on every rating computation (hot path for
-// `get_average_rating`, `get_badge`, and leaderboard updates), so an unbounded
+// `get_average_rating`, `get_score_badge`, and leaderboard updates), so an unbounded
 // list would make those calls progressively more expensive (issue #1177).
 const MAX_STAKE_TIERS: u32 = 10;
 
@@ -2084,7 +2146,15 @@ impl ReputationContract {
         }
     }
 
-    /// Get the reputation tier for a user based on their average rating.
+    /// Get the **rating tier** for a user — their standing on the *quality* ladder,
+    /// thresholded on `average_rating` (Bronze ≥ 100, Silver ≥ 300, Gold ≥ 500,
+    /// Platinum ≥ 700 on the 0–10,000 scale).
+    ///
+    /// Because `average_rating` is an average, this is independent of how many
+    /// reviews a user has. It is **not** the same measure as
+    /// [`Self::get_score_badge`], which ranks accumulated volume — the two use
+    /// different inputs and thresholds and often disagree. See the module docs
+    /// (issue #1172).
     pub fn get_tier(env: Env, user: Address) -> ReputationTier {
         match Self::get_average_rating(env, user) {
             Ok(avg_rating) => calculate_tier(avg_rating),
@@ -2092,7 +2162,13 @@ impl ReputationContract {
         }
     }
 
-    /// Get all badges awarded to a user.
+    /// Get every **rating tier** the user has ever reached, as permanent
+    /// [`AwardedBadge`] records (`badge_type` is a [`ReputationTier`]).
+    ///
+    /// Unrelated to [`Self::get_score_badge`], and not a live view: these records
+    /// are written by `submit_review` when a tier is first crossed and are never
+    /// removed, so a user can hold a `Gold` awarded badge while their current tier
+    /// and score badge have decayed below it.
     pub fn get_badges(env: Env, user: Address) -> Vec<AwardedBadge> {
         let badges_key = DataKey::Badges(user);
         let badges: Option<Vec<AwardedBadge>> = env.storage().persistent().get(&badges_key);
@@ -2109,32 +2185,51 @@ impl ReputationContract {
         }
     }
 
-    /// Get the current badge for a user based on their score.
-    /// Badges are computed dynamically from score:
-    /// - Bronze: score ≥ 100
-    /// - Silver: score ≥ 500
-    /// - Gold: score ≥ 2000
-    /// Returns None if the user has no reputation or score < 100.
-    pub fn get_badge(env: Env, user: Address) -> Option<Badge> {
+    /// Get the current **score badge** for a user — their standing on the *volume*
+    /// ladder, thresholded on the raw decayed `total_score`:
+    /// - [`ScoreBadge::Rising`]: score ≥ 100
+    /// - [`ScoreBadge::Established`]: score ≥ 500
+    /// - [`ScoreBadge::Elite`]: score ≥ 2000
+    ///
+    /// Returns `None` if the user has no reputation entry or their decayed score is
+    /// below 100.
+    ///
+    /// This is **not** [`Self::get_tier`]. `total_score` is the sum of
+    /// `rating × stake_weight` over all reviews, so this ladder rises with review
+    /// count and staked amount, while the rating tier is an average and does not.
+    /// The two answer different questions and routinely disagree; the ladders have
+    /// different rungs on purpose (there is no Platinum score badge). See the module
+    /// docs (issue #1172).
+    ///
+    /// Renamed from `get_badge`, which remains available as an alias.
+    pub fn get_score_badge(env: Env, user: Address) -> Option<ScoreBadge> {
         let rep_key = DataKey::Reputation(user.clone());
         let reputation: Option<UserReputation> = env.storage().persistent().get(&rep_key);
-        
+
         match reputation {
             Some(_rep) => {
                 bump_reputation_ttl(&env, &user);
                 let (score, _total_weight, _review_count) = Self::get_decayed_totals(&env, user);
                 if score >= 2000 {
-                    Some(Badge::Gold)
+                    Some(ScoreBadge::Elite)
                 } else if score >= 500 {
-                    Some(Badge::Silver)
+                    Some(ScoreBadge::Established)
                 } else if score >= 100 {
-                    Some(Badge::Bronze)
+                    Some(ScoreBadge::Rising)
                 } else {
                     None
                 }
             }
             None => None,
         }
+    }
+
+    /// Backwards-compatible alias of [`Self::get_score_badge`], kept so existing
+    /// integrations keep working after the issue #1172 rename. Prefer
+    /// `get_score_badge`, whose name states which of the two reputation ladders it
+    /// reports.
+    pub fn get_badge(env: Env, user: Address) -> Option<ScoreBadge> {
+        Self::get_score_badge(env, user)
     }
 
     /// Claim staked tokens back after a lockup period. Allows reviewers to withdraw
@@ -2684,7 +2779,7 @@ mod tests {
     }
 
     // Seeds both the `Reputation` accumulator and a matching `Reviews` entry so
-    // that `get_decayed_totals` (used by `get_badge`) reports the same score as
+    // that `get_decayed_totals` (used by `get_score_badge`) reports the same score as
     // the raw `total_score` when no decay has elapsed (issue #976).
     fn seed_reputation_with_review(
         env: &Env,
@@ -2732,23 +2827,105 @@ mod tests {
         let user = Address::generate(&env);
 
         // Test no badge for user with no reputation
-        assert_eq!(client.get_badge(&user), None);
+        assert_eq!(client.get_score_badge(&user), None);
 
-        // Test Bronze badge (score >= 100)
+        // Test Rising badge (score >= 100)
         seed_reputation_with_review(&env, &contract_id, &user, 100, 10, 1);
-        assert_eq!(client.get_badge(&user), Some(Badge::Bronze));
+        assert_eq!(client.get_score_badge(&user), Some(ScoreBadge::Rising));
 
-        // Test Silver badge (score >= 500)
+        // Test Established badge (score >= 500)
         seed_reputation_with_review(&env, &contract_id, &user, 500, 50, 5);
-        assert_eq!(client.get_badge(&user), Some(Badge::Silver));
+        assert_eq!(client.get_score_badge(&user), Some(ScoreBadge::Established));
 
-        // Test Gold badge (score >= 2000)
+        // Test Elite badge (score >= 2000)
         seed_reputation_with_review(&env, &contract_id, &user, 2000, 200, 20);
-        assert_eq!(client.get_badge(&user), Some(Badge::Gold));
+        assert_eq!(client.get_score_badge(&user), Some(ScoreBadge::Elite));
 
         // Test no badge for score < 100
         seed_reputation_with_review(&env, &contract_id, &user, 99, 10, 1);
-        assert_eq!(client.get_badge(&user), None);
+        assert_eq!(client.get_score_badge(&user), None);
+    }
+
+    /// #1172 — the deprecated `get_badge` name must keep answering exactly like
+    /// `get_score_badge` so existing integrations are unaffected by the rename.
+    #[test]
+    fn test_get_badge_alias_matches_get_score_badge() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        let user = Address::generate(&env);
+        assert_eq!(client.get_badge(&user), client.get_score_badge(&user));
+
+        for (score, weight, count) in [(99u64, 10u64, 1u32), (100, 10, 1), (500, 50, 5), (2000, 200, 20)] {
+            seed_reputation_with_review(&env, &contract_id, &user, score, weight, count);
+            assert_eq!(client.get_badge(&user), client.get_score_badge(&user));
+        }
+    }
+
+    /// Seed `count` reviews of the given rating and stake weight, so a test can
+    /// control `total_score` (Σ rating × weight) and `total_weight` (Σ weight)
+    /// independently of each other.
+    fn seed_reviews(
+        env: &Env,
+        contract_id: &Address,
+        user: &Address,
+        rating: u32,
+        stake_weight: i128,
+        count: u32,
+    ) {
+        env.as_contract(contract_id, || {
+            let mut reviews = Vec::new(env);
+            for _ in 0..count {
+                reviews.push_back(Review {
+                    reviewer: user.clone(),
+                    reviewee: user.clone(),
+                    job_id: 0,
+                    rating,
+                    comment: String::from_str(env, ""),
+                    stake_weight,
+                    timestamp: 0,
+                });
+            }
+            env.storage().persistent().set(
+                &DataKey::Reputation(user.clone()),
+                &UserReputation {
+                    user: user.clone(),
+                    total_score: 0,
+                    total_weight: 0,
+                    review_count: count,
+                    last_updated_ts: 0,
+                },
+            );
+            env.storage()
+                .persistent()
+                .set(&DataKey::Reviews(user.clone()), &reviews);
+        });
+    }
+
+    /// #1172 — the score badge and the rating tier are separate ladders. A user with
+    /// one small perfect review ranks high on quality and nowhere on volume; a user
+    /// with lots of mediocre, heavily-staked reviews does the opposite. This pins
+    /// that divergence so the two are never "fixed" into agreement.
+    #[test]
+    fn test_score_badge_and_rating_tier_are_independent_ladders() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        // One 5★ review of weight 1: average_rating = 5 * 100 / 1 = 500 -> Gold
+        // tier, but total_score = 5 -> below the score ladder's first rung.
+        let sparse = Address::generate(&env);
+        seed_reviews(&env, &contract_id, &sparse, 5, 1, 1);
+        assert_eq!(client.get_tier(&sparse), ReputationTier::Gold);
+        assert_eq!(client.get_score_badge(&sparse), None);
+
+        // Ten 2★ reviews of weight 100: total_score = 2000 -> Elite badge, while
+        // average_rating = 2000 * 100 / 1000 = 200 -> only Bronze tier.
+        let prolific = Address::generate(&env);
+        seed_reviews(&env, &contract_id, &prolific, 2, 100, 10);
+        assert_eq!(client.get_score_badge(&prolific), Some(ScoreBadge::Elite));
+        assert_eq!(client.get_tier(&prolific), ReputationTier::Bronze);
     }
 
     #[test]
@@ -2767,14 +2944,14 @@ mod tests {
         seed_reputation_with_review(&env, &contract_id, &user, 2000, 200, 20);
 
         // Freshly earned: both views agree the user has standing.
-        assert_eq!(client.get_badge(&user), Some(Badge::Gold));
+        assert_eq!(client.get_score_badge(&user), Some(ScoreBadge::Elite));
         assert_ne!(client.get_tier(&user), ReputationTier::None);
 
         // Advance a full year so the review fully decays.
         env.ledger()
             .with_mut(|l| l.timestamp = ONE_YEAR_IN_SECONDS);
 
-        assert_eq!(client.get_badge(&user), None);
+        assert_eq!(client.get_score_badge(&user), None);
         assert_eq!(client.get_tier(&user), ReputationTier::None);
     }
 

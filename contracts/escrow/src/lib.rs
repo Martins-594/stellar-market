@@ -61,7 +61,7 @@ pub enum EscrowError {
     /// The milestone list is empty.
     EmptyMilestones = 33,
     /// The number of milestones exceeds the permitted limit.
-    TooManyMilestones = 48,
+    TooManyMilestones = 34,
     /// The fee basis points exceed the maximum permitted limit.
     InvalidFee = 35,
     /// Proposal execution is time-locked and cannot be executed yet.
@@ -165,11 +165,20 @@ pub struct MultiSigProposal {
 ///                                │
 ///                    resolve_dispute_callback
 ///                                │
-///                    ┌───────────┴───────────┐
-///                    ▼                       ▼
-///              ┌───────────┐           ┌───────────┐
-///              │ Completed │           │ Cancelled │
-///              └───────────┘           └───────────┘
+///                    ┌───────────┼───────────────────────┐
+///                    │           │                       │
+///          FreelancerWins    ClientWins /            Escalate
+///                    │       RefundBoth /                 │
+///                    │       RefundSplit /       (status unchanged —
+///                    │       MaliciousFiling      job stays Disputed,
+///                    │           │                no funds moved)
+///                    ▼           ▼                        │
+///              ┌───────────┐ ┌───────────┐                │
+///              │ Completed │ │ Cancelled │ <──────────────┘
+///              └───────────┘ └───────────┘   a later resolve_dispute_callback
+///                    ▲                       with a final resolution
+///                    │
+///                    └── (or expire_job once the deadline passes ──> Expired)
 /// ```
 ///
 /// ## State Descriptions
@@ -179,6 +188,9 @@ pub struct MultiSigProposal {
 /// - **InProgress**: Work has begun. Milestones can be submitted, approved, or disputed.
 /// - **Completed**: All milestones approved and payments released. Terminal state.
 /// - **Disputed**: A dispute has been raised. Only dispute resolution can change state.
+///   Not a terminal state: an `Escalate` resolution leaves the job here (see
+///   [Escalated disputes](#escalated-disputes)) until a later resolution or
+///   `expire_job` moves it on.
 /// - **Cancelled**: Job was cancelled or refunded. Terminal state.
 /// - **Expired**: Job deadline passed without completion. Terminal state.
 ///
@@ -194,10 +206,45 @@ pub struct MultiSigProposal {
 /// | InProgress  | Disputed    | External dispute contract     | Either party raises dispute         |
 /// | InProgress  | Cancelled   | `cancel_job`                  | No active work, client cancels      |
 /// | InProgress  | Expired     | `expire_job`                  | Deadline passed                     |
-/// | Disputed    | Completed   | `resolve_dispute_callback`    | Resolution favors freelancer        |
-/// | Disputed    | Cancelled   | `resolve_dispute_callback`    | Resolution favors client            |
+/// | Disputed    | Completed   | `resolve_dispute_callback`    | `FreelancerWins`                    |
+/// | Disputed    | Cancelled   | `resolve_dispute_callback`    | `ClientWins`, `RefundBoth`, `RefundSplit`, `MaliciousFiling` |
+/// | Disputed    | Disputed    | `resolve_dispute_callback`    | `Escalate` — no state change, no payout |
+/// | Disputed    | Expired     | `expire_job`                  | Deadline passed while still disputed |
 ///
 /// Terminal states (Completed, Cancelled, Expired) cannot transition to any other state.
+///
+/// ## Escalated disputes
+///
+/// [`DisputeResolution::Escalate`] is the one resolution that does **not** settle a
+/// job. In `resolve_dispute_callback` its arm is deliberately empty: no token is
+/// transferred (`apply_dispute_distribution` is a no-op for `Escalate`,
+/// and `calculate_payout` reports an all-zero [`PayoutBreakdown`]) and the job's
+/// status is left exactly as it was — a disputed job stays `Disputed`, holding the
+/// full escrowed balance. It is a self-loop, not a terminal transition.
+///
+/// The escalation itself is recorded off this contract: `resolve_dispute_callback`
+/// still emits the `("escrow", "dispute")` event carrying `Escalate`, which is the
+/// signal for the dispute contract / off-chain arbitration tier to pick the case up.
+/// This contract holds no escalation queue, deadline, or auto-resolution timer of
+/// its own, so nothing here will move the job on by itself.
+///
+/// **How an escalated job leaves `Disputed`** — one of two paths, both externally
+/// driven:
+///
+/// 1. **Re-resolution (expected path).** The dispute contract calls
+///    `resolve_dispute_callback` again with a final resolution. This is permitted
+///    because `require_state_disputable` accepts `Disputed` as an input state, so
+///    an escalated job can be resolved any number of times until a non-`Escalate`
+///    resolution settles it. The remaining balance is recomputed from the job's
+///    approved milestones at that point, so no funds are lost by escalating first.
+/// 2. **Expiry (backstop).** Once `job.job_deadline` has passed, anyone may call
+///    `expire_job`; `require_state_expirable` rejects only the terminal states, so a
+///    `Disputed` job is expirable. Approved milestones are paid out to the freelancer
+///    and the remainder is refunded to the client, and the job becomes `Expired`.
+///
+/// Responsibility for driving path 1 sits with the dispute contract's arbitration
+/// tier, not with the escrow contract. If it never does so, the job remains in
+/// `Disputed` with funds escrowed until the deadline makes path 2 available.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobStatus {
@@ -217,6 +264,9 @@ pub enum DisputeResolution {
     FreelancerWins,
     RefundBoth,
     RefundSplit(u32),
+    /// Hand the dispute to a higher arbitration tier. Settles nothing: no funds are
+    /// moved and the job keeps its current status (a disputed job stays `Disputed`).
+    /// See the [`JobStatus`] state-machine docs, "Escalated disputes".
     Escalate,
     /// Dispute was filed in bad faith; initiator's full stake is sent to treasury.
     MaliciousFiling,
@@ -1934,8 +1984,19 @@ impl EscrowContract {
     }
 
     /// Called by the dispute contract to resolve a disputed job and distribute funds.
-    /// Uses the full DisputeResolution enum to correctly handle all four outcomes,
+    /// Uses the full DisputeResolution enum to correctly handle every outcome,
     /// including the zero-remaining edge case where only the job status needs updating.
+    ///
+    /// Outcomes: `FreelancerWins` → `Completed`; `ClientWins`, `RefundBoth`,
+    /// `RefundSplit` and `MaliciousFiling` → `Cancelled`; `Escalate` → **no state
+    /// change and no payout** — the job stays in its current (`Disputed`) state with
+    /// the escrow intact, awaiting either another call to this function with a final
+    /// resolution or `expire_job` after the deadline. See the [`JobStatus`]
+    /// state-machine docs, "Escalated disputes", for the full rationale.
+    ///
+    /// Because [`require_state_disputable`] accepts `Disputed`, this function is
+    /// deliberately re-callable: escalation is a hand-off to a higher arbitration
+    /// tier, not a final answer.
     pub fn resolve_dispute_callback(
         env: Env,
         job_id: u64,
@@ -2016,7 +2077,12 @@ impl EscrowContract {
                 job.status = JobStatus::Completed;
             }
             DisputeResolution::Escalate => {
-                // Leave status unchanged.
+                // Leave status unchanged: the job stays Disputed (a self-loop) with
+                // the escrow untouched. Escalation hands the case to a higher
+                // arbitration tier, which is expected to call this function again
+                // with a final resolution; `expire_job` remains the backstop once
+                // the deadline passes. Documented on `JobStatus` under
+                // "Escalated disputes".
             }
         }
 
@@ -4391,6 +4457,9 @@ impl EscrowContract {
         // (Completed, Cancelled, or Expired).  These are the same guard used by
         // propose_revision and submit_milestone.
         require_state_not_terminal(&job)?;
+        // Reject calls while a dispute is active — arbitrators and the other
+        // party rely on deadline state staying fixed during resolution.
+        require_state_not_disputed(&job)?;
 
         let mut milestones = job.milestones.clone();
         let mut milestone = milestones

@@ -4469,3 +4469,397 @@ fn test_legitimate_review_and_claim_unaffected() {
     reputation_client.claim_stake(&reviewer, &MIN_STAKE);
     assert_eq!(reputation_client.get_stake_balance(&reviewer), 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #1173 — get_leaderboard_page pagination behaviour
+//
+// Only the zero-argument `get_leaderboard()` wrapper (offset=0, limit=50) was
+// exercised before, so offset/limit handling, clamping and out-of-range offsets
+// were untested. These tests drive `get_leaderboard_page` directly.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Write a leaderboard of `count` entries straight into instance storage,
+/// descending by rating (1000, 990, 980, …) exactly as `update_leaderboard`
+/// maintains it. Returns the addresses in leaderboard order.
+///
+/// Seeding directly keeps these tests focused on pagination arithmetic and lets
+/// them exceed the 50-entry limit cheaply; `test_leaderboard_page_offset_and_limit_
+/// with_real_reviews` covers the same code path on a leaderboard built by
+/// `submit_review`.
+fn seed_leaderboard(env: &Env, contract_id: &Address, count: u32) -> soroban_sdk::Vec<Address> {
+    let mut addresses = soroban_sdk::Vec::new(env);
+    let mut entries: soroban_sdk::Vec<(Address, u64)> = soroban_sdk::Vec::new(env);
+    for i in 0..count {
+        let addr = Address::generate(env);
+        addresses.push_back(addr.clone());
+        entries.push_back((addr, 1000u64 - (i as u64) * 10));
+    }
+    env.as_contract(contract_id, || {
+        env.storage().instance().set(&DataKey::Leaderboard, &entries);
+    });
+    addresses
+}
+
+#[test]
+fn test_leaderboard_page_first_page_matches_default_wrapper() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &contract_id);
+    seed_leaderboard(&env, &contract_id, 10);
+
+    // The wrapper is exactly get_leaderboard_page(0, 50).
+    assert_eq!(client.get_leaderboard_page(&0, &50), client.get_leaderboard());
+}
+
+#[test]
+fn test_leaderboard_page_non_zero_offset_returns_correct_slice() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let addresses = seed_leaderboard(&env, &contract_id, 10);
+
+    let page = client.get_leaderboard_page(&3, &4);
+    assert_eq!(page.len(), 4);
+    for i in 0..4u32 {
+        let (addr, rating) = page.get(i).unwrap();
+        assert_eq!(addr, addresses.get(3 + i).unwrap(), "entry {i} is off by one");
+        assert_eq!(rating, 1000 - ((3 + i) as u64) * 10);
+    }
+
+    // Consecutive pages tile the list without gaps or repeats.
+    let first = client.get_leaderboard_page(&0, &5);
+    let second = client.get_leaderboard_page(&5, &5);
+    assert_eq!(first.len(), 5);
+    assert_eq!(second.len(), 5);
+    for i in 0..5u32 {
+        assert_eq!(first.get(i).unwrap().0, addresses.get(i).unwrap());
+        assert_eq!(second.get(i).unwrap().0, addresses.get(5 + i).unwrap());
+    }
+}
+
+#[test]
+fn test_leaderboard_page_custom_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let addresses = seed_leaderboard(&env, &contract_id, 10);
+
+    let page = client.get_leaderboard_page(&0, &1);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0).unwrap().0, addresses.get(0).unwrap());
+
+    // A limit of zero is a legitimate (if useless) request: empty page, no panic.
+    assert_eq!(client.get_leaderboard_page(&0, &0).len(), 0);
+
+    // A limit larger than what remains is truncated at the end of the list.
+    let tail = client.get_leaderboard_page(&8, &10);
+    assert_eq!(tail.len(), 2);
+    assert_eq!(tail.get(0).unwrap().0, addresses.get(8).unwrap());
+    assert_eq!(tail.get(1).unwrap().0, addresses.get(9).unwrap());
+}
+
+#[test]
+fn test_leaderboard_page_limit_is_clamped_to_fifty() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let addresses = seed_leaderboard(&env, &contract_id, 60);
+
+    // Anything above the 50 maximum yields exactly 50 entries, including u32::MAX
+    // (which would overflow offset + limit without the saturating add).
+    assert_eq!(client.get_leaderboard_page(&0, &51).len(), 50);
+    assert_eq!(client.get_leaderboard_page(&0, &1000).len(), 50);
+    assert_eq!(client.get_leaderboard_page(&0, &u32::MAX).len(), 50);
+
+    // Clamping applies from the offset, not from the start of the list.
+    let page = client.get_leaderboard_page(&5, &u32::MAX);
+    assert_eq!(page.len(), 50);
+    assert_eq!(page.get(0).unwrap().0, addresses.get(5).unwrap());
+    assert_eq!(page.get(49).unwrap().0, addresses.get(54).unwrap());
+}
+
+#[test]
+fn test_leaderboard_page_out_of_range_offset_is_empty() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &contract_id);
+    seed_leaderboard(&env, &contract_id, 10);
+
+    // offset == total and beyond: empty, never a panic.
+    assert_eq!(client.get_leaderboard_page(&10, &5).len(), 0);
+    assert_eq!(client.get_leaderboard_page(&11, &5).len(), 0);
+    assert_eq!(client.get_leaderboard_page(&u32::MAX, &5).len(), 0);
+
+    // Last valid offset still returns a single entry.
+    assert_eq!(client.get_leaderboard_page(&9, &5).len(), 1);
+}
+
+#[test]
+fn test_leaderboard_page_empty_leaderboard_is_empty_at_any_offset() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &contract_id);
+
+    // No leaderboard entry has ever been written.
+    assert_eq!(client.get_leaderboard_page(&0, &50).len(), 0);
+    assert_eq!(client.get_leaderboard_page(&7, &50).len(), 0);
+}
+
+#[test]
+fn test_leaderboard_page_offset_applies_after_banned_users_are_filtered() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1u32, &0u32);
+    let addresses = seed_leaderboard(&env, &contract_id, 5);
+
+    // Ban the top-ranked user: paging must index into the filtered list, so
+    // offset 0 is now the second-ranked user and the last offset falls away.
+    client.ban_user(&admin, &addresses.get(0).unwrap());
+
+    let page = client.get_leaderboard_page(&0, &50);
+    assert_eq!(page.len(), 4);
+    assert_eq!(page.get(0).unwrap().0, addresses.get(1).unwrap());
+
+    let page = client.get_leaderboard_page(&3, &50);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0).unwrap().0, addresses.get(4).unwrap());
+
+    assert_eq!(client.get_leaderboard_page(&4, &50).len(), 0);
+}
+
+#[test]
+fn test_leaderboard_page_offset_and_limit_with_real_reviews() {
+    let env = setup_high_ttl_env();
+    env.mock_all_auths();
+    let escrow_id = env.register_contract(None, EscrowContract);
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+    let admin = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1u32, &0u32);
+
+    // Three reviewees with distinct ratings, so leaderboard order is deterministic.
+    let mut reviewees = soroban_sdk::Vec::new(&env);
+    for (i, rating) in [5u32, 4u32, 3u32].iter().enumerate() {
+        let reviewer = Address::generate(&env);
+        let reviewee = Address::generate(&env);
+        setup_review_for(
+            &env,
+            &escrow_id,
+            &client,
+            i as u64 + 1,
+            &reviewer,
+            &reviewee,
+            *rating,
+        );
+        reviewees.push_back(reviewee);
+    }
+
+    let full = client.get_leaderboard_page(&0, &50);
+    assert_eq!(full.len(), 3);
+
+    // Paging through a leaderboard built by submit_review returns the same
+    // entries in the same order as the unpaginated read.
+    let middle = client.get_leaderboard_page(&1, &1);
+    assert_eq!(middle.len(), 1);
+    assert_eq!(middle.get(0).unwrap(), full.get(1).unwrap());
+
+    let last_two = client.get_leaderboard_page(&1, &10);
+    assert_eq!(last_two.len(), 2);
+    assert_eq!(last_two.get(0).unwrap(), full.get(1).unwrap());
+    assert_eq!(last_two.get(1).unwrap(), full.get(2).unwrap());
+
+    assert_eq!(client.get_leaderboard_page(&3, &10).len(), 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #1174 — get_effective_weight decay coverage
+//
+// `get_effective_weight` implements its own decay formula, independent of
+// `get_decayed_totals`, and had no test coverage at all. These pin the formula
+// across its whole range and cross-check it against `get_decayed_totals` so the
+// two cannot silently diverge.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A review recorded at `timestamp` carrying `stake_weight`.
+fn review_at(env: &Env, stake_weight: i128, timestamp: u64) -> Review {
+    Review {
+        reviewer: Address::generate(env),
+        reviewee: Address::generate(env),
+        job_id: 1,
+        rating: 5,
+        comment: String::from_str(env, "ok"),
+        stake_weight,
+        timestamp,
+    }
+}
+
+/// Register a reputation contract configured with `decay_rate`% annual decay;
+/// `get_effective_weight` reads the rate from instance storage.
+fn effective_weight_client<'a>(env: &'a Env, decay_rate: u32) -> ReputationContractClient<'a> {
+    let contract_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    client.initialize(&vec![env, admin], &1u32, &decay_rate);
+    client
+}
+
+#[test]
+fn test_effective_weight_fresh_review_keeps_full_weight() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = effective_weight_client(&env, 10);
+
+    // Zero elapsed time -> decay factor 100% -> full stake weight.
+    let review = review_at(&env, 1_000_i128, 0);
+    assert_eq!(client.get_effective_weight(&review, &0), 1_000);
+
+    // Still effectively fresh well inside the first year: 10% * 0.1yr = 1% off.
+    let tenth_of_a_year = ONE_YEAR_IN_SECONDS / 10;
+    assert_eq!(
+        client.get_effective_weight(&review, &tenth_of_a_year),
+        990,
+        "10%/yr for a tenth of a year should shave exactly 1%"
+    );
+}
+
+#[test]
+fn test_effective_weight_zero_decay_rate_never_decays() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = effective_weight_client(&env, 0);
+
+    let review = review_at(&env, 1_000_i128, 0);
+    assert_eq!(client.get_effective_weight(&review, &0), 1_000);
+    assert_eq!(
+        client.get_effective_weight(&review, &(ONE_YEAR_IN_SECONDS * 100)),
+        1_000,
+        "with decay disabled, age must not matter"
+    );
+}
+
+#[test]
+fn test_effective_weight_partial_decay_is_linear_in_age() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = effective_weight_client(&env, 10); // 10% per year
+
+    let review = review_at(&env, 1_000_i128, 0);
+
+    // Retained = 100 - 10 * years.
+    assert_eq!(client.get_effective_weight(&review, &ONE_YEAR_IN_SECONDS), 900);
+    assert_eq!(
+        client.get_effective_weight(&review, &(ONE_YEAR_IN_SECONDS * 3)),
+        700
+    );
+    assert_eq!(
+        client.get_effective_weight(&review, &(ONE_YEAR_IN_SECONDS * 5)),
+        500
+    );
+    assert_eq!(
+        client.get_effective_weight(&review, &(ONE_YEAR_IN_SECONDS * 9)),
+        100
+    );
+
+    // Age is measured from the review's own timestamp, not from epoch.
+    let later = review_at(&env, 1_000_i128, ONE_YEAR_IN_SECONDS * 4);
+    assert_eq!(
+        client.get_effective_weight(&later, &(ONE_YEAR_IN_SECONDS * 9)),
+        500,
+        "a 5-year-old review must decay like any other 5-year-old review"
+    );
+}
+
+#[test]
+fn test_effective_weight_fully_decayed_is_zero_and_saturates() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = effective_weight_client(&env, 10); // 10% per year
+
+    let review = review_at(&env, 1_000_i128, 0);
+
+    // Exactly 10 years: retained 0%.
+    assert_eq!(
+        client.get_effective_weight(&review, &(ONE_YEAR_IN_SECONDS * 10)),
+        0
+    );
+    // Beyond full decay the factor saturates at 0 rather than wrapping.
+    assert_eq!(
+        client.get_effective_weight(&review, &(ONE_YEAR_IN_SECONDS * 50)),
+        0
+    );
+    assert_eq!(client.get_effective_weight(&review, &u64::MAX), 0);
+}
+
+#[test]
+fn test_effective_weight_future_timestamp_is_not_negative_decay() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = effective_weight_client(&env, 10);
+
+    // current_time before the review's timestamp: age saturates to 0, so the
+    // weight is full — never inflated above the staked amount.
+    let review = review_at(&env, 1_000_i128, ONE_YEAR_IN_SECONDS * 5);
+    assert_eq!(client.get_effective_weight(&review, &0), 1_000);
+}
+
+#[test]
+fn test_effective_weight_non_positive_stake_uses_weight_of_one() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = effective_weight_client(&env, 10);
+
+    // A review carrying no stake still counts as weight 1 when fresh.
+    let unstaked = review_at(&env, 0_i128, 0);
+    assert_eq!(client.get_effective_weight(&unstaked, &0), 1);
+
+    // ...and that single unit decays away to nothing (integer division).
+    assert_eq!(
+        client.get_effective_weight(&unstaked, &(ONE_YEAR_IN_SECONDS * 5)),
+        0
+    );
+
+    // A negative stake weight is treated the same as zero, never negatively.
+    let negative = review_at(&env, -50_i128, 0);
+    assert_eq!(client.get_effective_weight(&negative, &0), 1);
+}
+
+#[test]
+fn test_effective_weight_agrees_with_get_decayed_totals() {
+    let env = setup_high_ttl_env();
+    env.mock_all_auths();
+    let escrow_id = env.register_contract(None, EscrowContract);
+    let reputation_id = env.register_contract(None, ReputationContract);
+    let client = ReputationContractClient::new(&env, &reputation_id);
+    let admin = Address::generate(&env);
+    client.initialize(&vec![&env, admin.clone()], &1u32, &10u32); // 10%/yr
+
+    let reviewer = Address::generate(&env);
+    let reviewee = Address::generate(&env);
+    setup_review_for(&env, &escrow_id, &client, 1, &reviewer, &reviewee, 5);
+
+    let review = client.get_reviews(&reviewee).get(0).unwrap();
+
+    // The two independently-implemented decay formulas must agree: with a single
+    // review, the reputation's decayed total_weight is that review's effective
+    // weight, both when fresh and part-way through the decay range.
+    let now = env.ledger().timestamp();
+    assert_eq!(
+        client.get_effective_weight(&review, &now) as u64,
+        client.get_reputation(&reviewee).total_weight
+    );
+
+    advance_n_periods(&env, 5); // 5 years -> 50% retained
+    let now = env.ledger().timestamp();
+    let effective = client.get_effective_weight(&review, &now);
+    assert_eq!(effective as u64, client.get_reputation(&reviewee).total_weight);
+    assert_eq!(effective, review.stake_weight / 2);
+}
