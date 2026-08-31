@@ -490,6 +490,91 @@ fn delegated_weight_is_snapshot_safe() {
     );
 }
 
+#[test]
+fn undelegate_removes_delegation_and_restores_direct_voting() {
+    let ctx = setup();
+    let delegate = voter_with(&ctx, 40, 500_000);
+    let delegator = voter_with(&ctx, 90, 500_000);
+
+    // Initial state: no delegation set
+    assert_eq!(ctx.escrow.get_delegate(&delegator), None);
+
+    // 1. Delegate away
+    ctx.escrow.delegate(&delegator, &delegate);
+    assert_eq!(ctx.escrow.get_delegate(&delegator), Some(delegate.clone()));
+
+    let id = ctx
+        .escrow
+        .propose_governance(&delegate, &AdminAction::SetFeeBps(250));
+
+    // Delegator cannot vote directly while delegated
+    assert_eq!(
+        ctx.escrow
+            .try_cast_vote(&delegator, &id, &VoteSupport::Against),
+        Err(Ok(GovError::DelegatedAway))
+    );
+
+    // 2. Undelegate
+    ctx.escrow.undelegate(&delegator);
+
+    // Verify delegation is completely cleared
+    assert_eq!(ctx.escrow.get_delegate(&delegator), None);
+
+    // Former delegate can no longer cast a delegated vote on delegator's behalf
+    ctx.escrow.cast_vote(&delegate, &id, &VoteSupport::For);
+    assert_eq!(
+        ctx.escrow
+            .try_cast_delegated_vote(&delegate, &id, &delegator),
+        Err(Ok(GovError::NotDelegate))
+    );
+
+    // Delegator can now vote directly with their full weight
+    ctx.escrow.cast_vote(&delegator, &id, &VoteSupport::Against);
+    let r = ctx.escrow.get_vote_receipt(&id, &delegator).unwrap();
+    assert_eq!(r.weight, 90);
+    assert!(!r.via_delegate);
+    assert_eq!(r.support, VoteSupport::Against);
+
+    let p = ctx.escrow.get_governance_proposal(&id).unwrap();
+    assert_eq!(p.for_weight, 40);
+    assert_eq!(p.against_weight, 90);
+}
+
+#[test]
+fn self_delegation_clears_existing_delegation() {
+    let ctx = setup();
+    let delegate = voter_with(&ctx, 40, 500_000);
+    let delegator = voter_with(&ctx, 90, 500_000);
+
+    // Set delegation to delegate
+    ctx.escrow.delegate(&delegator, &delegate);
+    assert_eq!(ctx.escrow.get_delegate(&delegator), Some(delegate.clone()));
+
+    // Self-delegation (delegating to oneself) clears the delegation
+    ctx.escrow.delegate(&delegator, &delegator);
+    assert_eq!(ctx.escrow.get_delegate(&delegator), None);
+
+    // Verify direct voting is restored
+    let id = ctx
+        .escrow
+        .propose_governance(&delegate, &AdminAction::SetFeeBps(250));
+    ctx.escrow.cast_vote(&delegator, &id, &VoteSupport::For);
+    let r = ctx.escrow.get_vote_receipt(&id, &delegator).unwrap();
+    assert_eq!(r.weight, 90);
+    assert!(!r.via_delegate);
+}
+
+#[test]
+fn undelegate_when_not_delegated_succeeds_gracefully() {
+    let ctx = setup();
+    let delegator = voter_with(&ctx, 90, 500_000);
+
+    assert_eq!(ctx.escrow.get_delegate(&delegator), None);
+    // Undelegating when no delegation is active does not error
+    ctx.escrow.undelegate(&delegator);
+    assert_eq!(ctx.escrow.get_delegate(&delegator), None);
+}
+
 // ============================================================
 // Governance / multisig separation of powers
 // ============================================================
