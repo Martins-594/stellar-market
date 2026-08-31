@@ -4457,6 +4457,9 @@ impl EscrowContract {
         // (Completed, Cancelled, or Expired).  These are the same guard used by
         // propose_revision and submit_milestone.
         require_state_not_terminal(&job)?;
+        // Reject calls while a dispute is active — arbitrators and the other
+        // party rely on deadline state staying fixed during resolution.
+        require_state_not_disputed(&job)?;
 
         let mut milestones = job.milestones.clone();
         let mut milestone = milestones

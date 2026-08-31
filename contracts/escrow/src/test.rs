@@ -479,6 +479,44 @@ fn test_extend_deadline() {
     assert_eq!(job.milestones.get(0).unwrap().deadline, 4000);
 }
 
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")] // InvalidStatus
+fn test_extend_deadline_fails_when_disputed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+
+    let contract_id = env.register_contract(None, EscrowContract);
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let freelancer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let milestones = vec![&env, (String::from_str(&env, "Task 1"), 100_i128, 2000_u64)];
+
+    let job_id = client.create_job(
+        &user,
+        &freelancer,
+        &token,
+        &milestones,
+        &3000_u64,
+        &GRACE_PERIOD,
+        &DEFAULT_EXPIRY_LEDGER,
+    );
+
+    // Force the job into Disputed state
+    env.as_contract(&client.address, || {
+        let key = crate::DataKey::Job(job_id);
+        let mut job: crate::Job = env.storage().persistent().get(&key).unwrap();
+        job.status = JobStatus::Disputed;
+        env.storage().persistent().set(&key, &job);
+    });
+
+    // Must be rejected with InvalidStatus (#3)
+    client.extend_deadline(&job_id, &0, &4000_u64);
+}
+
 // ── Helpers for claim_refund tests ───────────────────────────────────────────
 
 fn setup_refund_env(env: &Env) -> (EscrowContractClient<'_>, Address) {
