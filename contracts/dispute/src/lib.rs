@@ -318,6 +318,17 @@ const APPEAL_WINDOW_SECS: u64 = 172_800; // 48 hours
 /// Minimum votes required to resolve an appeal.
 const APPEAL_MIN_VOTES: u32 = 3;
 
+/// Minimum total votes before a MaliciousFiling determination can trigger
+/// (issue #1169). Below this, the ratio check alone could fire on a single
+/// stray vote (e.g. 1/1 = 100%).
+const MALICIOUS_FILING_MIN_VOTES: u32 = 5;
+/// Numerator of the malicious-filing supermajority ratio: requires
+/// `votes_for_malicious * MALICIOUS_FILING_SUPERMAJORITY_NUM >=
+/// total_votes * MALICIOUS_FILING_SUPERMAJORITY_DENOM`, i.e. ≥ 4/5 (80%).
+const MALICIOUS_FILING_SUPERMAJORITY_NUM: u32 = 4;
+/// Denominator of the malicious-filing supermajority ratio (see above).
+const MALICIOUS_FILING_SUPERMAJORITY_DENOM: u32 = 5;
+
 const NONCE_EXPIRY_LEDGERS: u32 = 3;
 
 const MIN_TTL_THRESHOLD: u32 = 1_000;
@@ -2352,9 +2363,12 @@ fn internal_resolve(
     }
 
     // ── Supermajority check: MaliciousFiling requires 4 out of every 5 votes ─────
-    // votes_for_malicious * 5 >= total_votes * 4  ↔  ≥ 80 % of all votes
-    let is_malicious_supermajority = total_votes >= 5
-        && dispute.votes_for_malicious.saturating_mul(5) >= total_votes.saturating_mul(4);
+    // votes_for_malicious * NUM >= total_votes * DENOM  ↔  ≥ 80 % of all votes
+    let is_malicious_supermajority = total_votes >= MALICIOUS_FILING_MIN_VOTES
+        && dispute
+            .votes_for_malicious
+            .saturating_mul(MALICIOUS_FILING_SUPERMAJORITY_DENOM)
+            >= total_votes.saturating_mul(MALICIOUS_FILING_SUPERMAJORITY_NUM);
 
     if is_malicious_supermajority {
         dispute.status = DisputeStatus::MaliciousDisputeFiling;
