@@ -1109,6 +1109,16 @@ impl EscrowContract {
             return Err(EscrowError::GovernanceRequired);
         }
 
+        // Validate the action's payload before the proposal is stored and opened
+        // for approval (issue #1154). `execute_proposal_internal` re-checks this,
+        // but catching it here means signers never spend coordination effort
+        // approving a proposal that was invalid the moment it was created.
+        if let AdminAction::SetFeeBps(fee) = action {
+            if fee > MAX_FEE_BPS {
+                return Err(EscrowError::InvalidFee);
+            }
+        }
+
         let mut count: u64 = env
             .storage()
             .instance()
