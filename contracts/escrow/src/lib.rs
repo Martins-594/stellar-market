@@ -601,6 +601,44 @@ fn is_signer(env: &Env, address: &Address) -> bool {
     }
 }
 
+/// Loads a multi-sig proposal from wherever it currently lives (issue #1153).
+///
+/// Pending proposals sit in instance storage so the governance flow can read and
+/// mutate them cheaply. Terminal ones (executed or expired) have been moved to
+/// persistent storage by `archive_proposal`. Looking in both places keeps error
+/// reporting honest: re-approving an already-executed proposal still reports
+/// `MultiSigAlreadyExecuted` rather than degrading to "not found".
+fn load_proposal(env: &Env, proposal_id: u64) -> Option<MultiSigProposal> {
+    let key = DataKey::MultiSigProposal(proposal_id);
+    env.storage()
+        .instance()
+        .get(&key)
+        .or_else(|| env.storage().persistent().get(&key))
+}
+
+/// Moves a terminal proposal out of instance storage and into persistent storage
+/// under a bounded TTL (issue #1153).
+///
+/// Instance storage is read in full on every invocation of this contract, so a
+/// proposal that can never be acted on again must not stay there. The companion
+/// `MultiSigExecutionNotBefore` entry is dropped outright — it only gates
+/// execution, which is no longer possible.
+fn archive_proposal(env: &Env, proposal_id: u64, proposal: &MultiSigProposal) {
+    let key = DataKey::MultiSigProposal(proposal_id);
+
+    env.storage().instance().remove(&key);
+    env.storage()
+        .instance()
+        .remove(&DataKey::MultiSigExecutionNotBefore(proposal_id));
+
+    env.storage().persistent().set(&key, proposal);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PROPOSAL_ARCHIVE_TTL_THRESHOLD,
+        PROPOSAL_ARCHIVE_TTL_LEDGERS,
+    );
+}
+
 // Production TTL constants based on Stellar's ~5-second ledger close time
 const LEDGERS_PER_DAY: u32 = 17_280; // 86,400 seconds/day ÷ 5 seconds/ledger
 const TTL_THRESHOLD_LEDGERS: u32 = LEDGERS_PER_DAY * 15; // 15 days = 259,200 ledgers
@@ -610,6 +648,16 @@ const INSTANCE_TTL_THRESHOLD: u32 = 50_000_000;
 const INSTANCE_TTL_EXTEND_TO: u32 = 50_000_000;
 
 const ESCROW_TTL_LEDGERS: u32 = 535_000; // ~90 days at 5s/ledger
+
+// Bounded TTL for archived multi-sig proposals (issue #1153). Once a proposal
+// reaches a terminal state (executed or expired) it is moved out of instance
+// storage — which is loaded in full on *every* contract invocation — into
+// persistent storage under the same `DataKey::MultiSigProposal(id)` key. The
+// record stays readable by auditors and off-chain tooling for ~30 days and then
+// expires on its own, so governance history can never grow without bound.
+const PROPOSAL_ARCHIVE_TTL_THRESHOLD: u32 = LEDGERS_PER_DAY * 15; // 15 days
+const PROPOSAL_ARCHIVE_TTL_LEDGERS: u32 = LEDGERS_PER_DAY * 30; // 30 days
+
 type EscrowKey = DataKey;
 
 #[contracttype]
@@ -1127,11 +1175,8 @@ impl EscrowContract {
             return Err(EscrowError::SignerNotFound);
         }
 
-        let mut proposal: MultiSigProposal = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiSigProposal(proposal_id))
-            .ok_or(EscrowError::MultiSigProposalNotFound)?;
+        let mut proposal: MultiSigProposal =
+            load_proposal(&env, proposal_id).ok_or(EscrowError::MultiSigProposalNotFound)?;
 
         if proposal.executed {
             return Err(EscrowError::MultiSigAlreadyExecuted);
@@ -1186,12 +1231,49 @@ impl EscrowContract {
         Self::execute_proposal_internal(&env, proposal_id)
     }
 
-    fn execute_proposal_internal(env: &Env, proposal_id: u64) -> Result<(), EscrowError> {
-        let mut proposal: MultiSigProposal = env
+    /// Retires an expired multi-sig proposal from instance storage (issue #1153).
+    ///
+    /// Executed proposals are archived automatically by `execute_proposal_internal`,
+    /// but a proposal that never reached its approval threshold simply goes stale
+    /// and would otherwise sit in instance storage forever. Instance storage is
+    /// loaded in full on every contract invocation, so stale governance proposals
+    /// tax every unrelated call. This moves such a proposal to persistent storage
+    /// under a bounded TTL, leaving instance storage holding only genuinely
+    /// pending proposals.
+    ///
+    /// # Authorization
+    /// Permissionless, in the same spirit as `bump_escrow`: it is pure storage
+    /// maintenance. Only proposals that are already past `PROPOSAL_TTL` — and so
+    /// can no longer be approved or executed — are eligible, meaning a caller
+    /// cannot use this to interfere with live governance.
+    ///
+    /// # Errors
+    /// * `MultiSigProposalNotFound` — no pending proposal with this ID
+    /// * `ProposalNotExpirable`     — the proposal's TTL has not yet elapsed
+    pub fn prune_expired_proposal(env: Env, proposal_id: u64) -> Result<(), EscrowError> {
+        let proposal: MultiSigProposal = env
             .storage()
             .instance()
             .get(&DataKey::MultiSigProposal(proposal_id))
             .ok_or(EscrowError::MultiSigProposalNotFound)?;
+
+        if env.ledger().timestamp() <= proposal.created_at + PROPOSAL_TTL {
+            return Err(EscrowError::ProposalNotExpirable);
+        }
+
+        archive_proposal(&env, proposal_id, &proposal);
+
+        env.events().publish(
+            (symbol_short!("msig"), symbol_short!("pruned")),
+            (proposal_id, proposal.proposer),
+        );
+
+        Ok(())
+    }
+
+    fn execute_proposal_internal(env: &Env, proposal_id: u64) -> Result<(), EscrowError> {
+        let mut proposal: MultiSigProposal =
+            load_proposal(env, proposal_id).ok_or(EscrowError::MultiSigProposalNotFound)?;
 
         if proposal.executed {
             return Err(EscrowError::MultiSigAlreadyExecuted);
@@ -1493,18 +1575,9 @@ impl EscrowContract {
         }
 
         proposal.executed = true;
-        env.storage()
-            .instance()
-            .set(&DataKey::MultiSigProposal(proposal_id), &proposal);
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::MultiSigExecutionNotBefore(proposal_id))
-        {
-            env.storage()
-                .instance()
-                .remove(&DataKey::MultiSigExecutionNotBefore(proposal_id));
-        }
+        // Terminal state: retire the proposal from instance storage so it stops
+        // being loaded on every invocation of this contract (issue #1153).
+        archive_proposal(env, proposal_id, &proposal);
 
         env.events().publish(
             (symbol_short!("msig"), symbol_short!("executed")),
