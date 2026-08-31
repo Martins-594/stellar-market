@@ -22,6 +22,11 @@ pub enum EscrowError {
     GracePeriodNotMet = 11,
     InvalidMilestoneIndex = 12,
     TokenNotAllowed = 13,
+    /// Also returned when an `AddSigner` proposal names an address that is
+    /// already a multi-sig signer (issue #1155) — the multi-sig configuration
+    /// the proposal asks for is already in place. `EscrowError` is at the SDK's
+    /// 50-variant cap, so this reuses the nearest existing variant rather than
+    /// adding one, in the same way `create_job` reuses `Unauthorized`.
     AlreadyInitialized = 14,
     ContractPaused = 15,
     NotAdmin = 16,
@@ -1359,12 +1364,16 @@ impl EscrowContract {
                     .instance()
                     .get(&DataKey::MultiSigSigners)
                     .unwrap();
-                if !signers.iter().any(|s| s == signer) {
-                    signers.push_back(signer);
-                    env.storage()
-                        .instance()
-                        .set(&DataKey::MultiSigSigners, &signers);
+                // A redundant add used to fall through silently and still mark the
+                // proposal executed, so nothing downstream could tell it apart from
+                // a real signer-set change. Fail loudly instead (issue #1155).
+                if signers.iter().any(|s| s == signer) {
+                    return Err(EscrowError::AlreadyInitialized);
                 }
+                signers.push_back(signer);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::MultiSigSigners, &signers);
             }
             AdminAction::RemoveSigner(signer) => {
                 let mut signers: Vec<Address> = env
@@ -1378,15 +1387,20 @@ impl EscrowContract {
                     .get(&DataKey::MultiSigThreshold)
                     .unwrap_or(1);
 
-                if let Some(idx) = signers.iter().position(|s| s == signer) {
-                    if signers.len() <= threshold {
-                        return Err(EscrowError::InvalidThreshold);
-                    }
-                    signers.remove(idx as u32);
-                    env.storage()
-                        .instance()
-                        .set(&DataKey::MultiSigSigners, &signers);
+                // Removing an address that is not a signer is a no-op, not a
+                // success — report it the same way `RotateSigner` already does
+                // for an unknown old signer (issue #1155).
+                let idx = signers
+                    .iter()
+                    .position(|s| s == signer)
+                    .ok_or(EscrowError::SignerNotFound)?;
+                if signers.len() <= threshold {
+                    return Err(EscrowError::InvalidThreshold);
                 }
+                signers.remove(idx as u32);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::MultiSigSigners, &signers);
             }
             AdminAction::ChangeThreshold(new_threshold) => {
                 let signers: Vec<Address> = env
