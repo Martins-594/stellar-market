@@ -1,0 +1,21 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "feat/issue-1121-escrow-event-projection-is-non-atomic-and-the",
+    "fix/reopen-1121",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "feat/issue-1121-escrow-event-projection-is-non-atomic-and-the": "main",
+    "fix/reopen-1121": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "feat/issue-1121-escrow-event-projection-is-non-atomic-and-the",
+    "fix/reopen-1121",
+    "origin"
+  ]
+}
