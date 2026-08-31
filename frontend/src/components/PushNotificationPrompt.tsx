@@ -4,9 +4,12 @@ import { useState, useEffect } from 'react';
 import { Bell, X } from 'lucide-react';
 import Button from './Button';
 
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000/api/v1';
+
 export default function PushNotificationPrompt() {
   const [showPrompt, setShowPrompt] = useState(false);
   const [permission, setPermission] = useState<NotificationPermission>('default');
+  const [subscribeError, setSubscribeError] = useState<string | null>(null);
 
   useEffect(() => {
     // Check if notifications are supported
@@ -37,8 +40,12 @@ export default function PushNotificationPrompt() {
       setPermission(permission);
 
       if (permission === 'granted') {
-        await subscribeToPushNotifications();
-        setShowPrompt(false);
+        const error = await subscribeToPushNotifications();
+        if (error) {
+          setSubscribeError(error);
+        } else {
+          setShowPrompt(false);
+        }
       }
     } catch (error) {
       console.error('Error requesting notification permission:', error);
@@ -94,6 +101,11 @@ export default function PushNotificationPrompt() {
               Not now
             </Button>
           </div>
+          {subscribeError && (
+            <p className="mt-2 text-sm text-red-600 dark:text-red-400" role="alert">
+              {subscribeError}
+            </p>
+          )}
         </div>
         <button
           onClick={handleDismiss}
@@ -107,7 +119,7 @@ export default function PushNotificationPrompt() {
   );
 }
 
-async function subscribeToPushNotifications() {
+async function subscribeToPushNotifications(): Promise<string | null> {
   try {
     const registration = await navigator.serviceWorker.ready;
 
@@ -115,7 +127,7 @@ async function subscribeToPushNotifications() {
     const vapidPublicKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
     if (!vapidPublicKey) {
       console.error('VAPID public key not configured');
-      return;
+      return 'Push notifications are not configured. Please contact support.';
     }
 
     const applicationServerKey = urlBase64ToUint8Array(vapidPublicKey);
@@ -124,20 +136,27 @@ async function subscribeToPushNotifications() {
       applicationServerKey: applicationServerKey.buffer as ArrayBuffer,
     });
 
-    // Send subscription to backend
-    const response = await fetch('/api/notifications/push/subscribe', {
+    const token = localStorage.getItem('stellarmarket_jwt');
+
+    // Send subscription to backend using the correct API URL and auth header
+    const response = await fetch(`${API_URL}/notifications/push/subscribe`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       body: JSON.stringify(subscription.toJSON()),
     });
 
     if (!response.ok) {
-      console.error('Failed to subscribe to push notifications');
+      console.error('Failed to subscribe to push notifications', response.status);
+      return 'Failed to enable push notifications. Please try again.';
     }
+
+    return null;
   } catch (error) {
     console.error('Error subscribing to push notifications:', error);
+    return 'An error occurred while enabling push notifications.';
   }
 }
 
