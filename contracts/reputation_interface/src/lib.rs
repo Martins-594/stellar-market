@@ -8,8 +8,15 @@
 
 use soroban_sdk::{contracttype, Address, Env};
 
-/// Achievement badges a user can earn, mirroring the reputation tiers exposed
-/// by the reputation contract.
+/// Achievement badges a user can earn, mirroring the **rating tiers**
+/// (`ReputationTier`: Bronze/Silver/Gold/Platinum, thresholded on `average_rating`)
+/// exposed by the reputation contract.
+///
+/// This is *not* the reputation contract's `ScoreBadge` ladder
+/// (Rising/Established/Elite), which is thresholded on the raw accumulated
+/// `total_score` and has different rungs — see the reputation contract's module
+/// docs (issue #1172). An implementor of [`ReputationVerifier::has_badge`] should
+/// resolve these against `get_tier`/`get_badges`, not against `get_score_badge`.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
