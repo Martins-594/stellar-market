@@ -79,8 +79,12 @@ export function applyEvent(state: EscrowProjection, event: EscrowEvent): EscrowP
   }
 }
 
-export async function projectJobState(jobId: string): Promise<EscrowProjection> {
-  const events = await prisma.escrowEvent.findMany({
+export async function projectJobState(
+  jobId: string,
+  tx?: Prisma.TransactionClient
+): Promise<EscrowProjection> {
+  const client = tx ?? prisma;
+  const events = await client.escrowEvent.findMany({
     where: { jobId },
     orderBy: { ledgerSeq: "asc" },
   });
@@ -100,48 +104,62 @@ export interface HandleEscrowEventInput {
 export async function handleEscrowEvent(eventData: HandleEscrowEventInput): Promise<void> {
   const { jobId, contractJobId, eventType, ledgerSeq, txHash, payload } = eventData;
 
-  try {
-    // Attempt insert — silently skip if duplicate
-    await prisma.escrowEvent.create({
-      data: {
-        jobId,
-        contractJobId,
-        eventType,
-        ledgerSeq,
-        txHash,
-        payload: (payload ?? {}) as Prisma.InputJsonValue,
-      },
-    });
-  } catch (error) {
-    // Check for unique constraint violation (idempotency key match). Duck-typed
-    // rather than `instanceof Prisma.PrismaClientKnownRequestError` so this also
-    // recognizes equivalent error shapes from test doubles/other DB drivers.
-    const isUniqueConstraintViolation =
-      typeof error === "object" && error !== null && "code" in error && error.code === "P2002";
-    if (isUniqueConstraintViolation) {
-      logger.info(
-        { contractJobId, eventType, ledgerSeq },
-        "[EscrowProjectionService] Duplicate event ignored"
-      );
-      return;
+  const result = await prisma.$transaction(async (tx) => {
+    // Lock the job row before reading/projecting so concurrent event handling
+    // for the same job serializes instead of producing a lost update.
+    await tx.$queryRaw`SELECT id FROM "Job" WHERE id = ${jobId} FOR UPDATE`;
+
+    try {
+      // Attempt insert — silently skip if duplicate
+      await tx.escrowEvent.create({
+        data: {
+          jobId,
+          contractJobId,
+          eventType,
+          ledgerSeq,
+          txHash,
+          payload: (payload ?? {}) as Prisma.InputJsonValue,
+        },
+      });
+    } catch (error) {
+      // Check for unique constraint violation (idempotency key match). Duck-typed
+      // rather than `instanceof Prisma.PrismaClientKnownRequestError` so this also
+      // recognizes equivalent error shapes from test doubles/other DB drivers.
+      const isUniqueConstraintViolation =
+        typeof error === "object" && error !== null && "code" in error && error.code === "P2002";
+      if (isUniqueConstraintViolation) {
+        logger.info(
+          { contractJobId, eventType, ledgerSeq },
+          "[EscrowProjectionService] Duplicate event ignored"
+        );
+        return null;
+      }
+      throw error;
     }
-    throw error;
+
+    // Fetch current Job state before updating
+    const previousState = await tx.job.findUnique({
+      where: { id: jobId },
+      select: { status: true, escrowStatus: true },
+    });
+
+    // Re-project current state from the complete event log
+    const nextState = await projectJobState(jobId, tx);
+
+    // Materialize projected state back into the Job table
+    await tx.job.update({
+      where: { id: jobId },
+      data: nextState,
+    });
+
+    return { previousState, nextState };
+  });
+
+  if (!result) {
+    return;
   }
 
-  // Fetch current Job state before updating
-  const previousState = await prisma.job.findUnique({
-    where: { id: jobId },
-    select: { status: true, escrowStatus: true },
-  });
-
-  // Re-project current state from the complete event log
-  const nextState = await projectJobState(jobId);
-
-  // Materialize projected state back into the Job table
-  await prisma.job.update({
-    where: { id: jobId },
-    data: nextState,
-  });
+  const { previousState, nextState } = result;
 
   // Execute event-specific side-effects and notifications
   const stateChanged =
