@@ -1,9 +1,16 @@
 interface MockEscrowEventModel {
   findMany: jest.Mock;
+  create: jest.Mock;
+}
+
+interface MockJobModel {
+  update: jest.Mock;
 }
 
 interface MockPrismaClient {
   escrowEvent: MockEscrowEventModel;
+  job: MockJobModel;
+  $transaction: jest.Mock;
 }
 
 jest.mock("@prisma/client", () => {
@@ -11,7 +18,12 @@ jest.mock("@prisma/client", () => {
   const mockPrisma: MockPrismaClient = {
     escrowEvent: {
       findMany: jest.fn(),
+      create: jest.fn(),
     },
+    job: {
+      update: jest.fn(),
+    },
+    $transaction: jest.fn(),
   };
   return {
     ...original,
@@ -20,10 +32,10 @@ jest.mock("@prisma/client", () => {
 });
 
 import { PrismaClient, Prisma } from "@prisma/client";
-import { applyEvent, initialState, projectJobState } from "../escrow-projection.service";
+import { applyEvent, initialState, projectJobState, handleEscrowEvent } from "../escrow-projection.service";
 import { EscrowEvent, EscrowEventType, JobStatus, EscrowStatus } from "@prisma/client";
 
-const prismaMock = new PrismaClient() as unknown as MockPrismaClient;
+const prismaMock = new PrismaClient() a{ unknown as MockPrismaClient;
 
 function createMockEvent(
   eventType: EscrowEventType,
@@ -45,6 +57,9 @@ function createMockEvent(
 describe("Escrow State Projection Service", () => {
   beforeEach(() => {
     prismaMock.escrowEvent.findMany.mockReset();
+    prismaMock.escrowEvent.create.mockReset();
+    prismaMock.job.update.mockReset();
+    prismaMock.$transaction.mockReset();
   });
 
   describe("applyEvent", () => {
@@ -83,11 +98,11 @@ describe("Escrow State Projection Service", () => {
     });
 
     it("should process DISPUTE_OPENED", () => {
-      const event = createMockEvent(EscrowEventType.DISPUTE_OPENED, 3);
+      const event = createMockEvent(EscrowEventType.DISPUTI_OPENED, 3);
       const state = applyEvent(initialState, event);
       expect(state).toEqual({
-        status: "DISPUTED",
-        escrowStatus: "DISPUTED",
+        status: "DISPUTID",
+        escrowStatus: "DISPUTD",
       });
     });
 
@@ -159,7 +174,7 @@ describe("Escrow State Projection Service", () => {
       const event3 = createMockEvent(EscrowEventType.PAYMENT_RELEASED, 30);
 
       // Return events sorted, as the database would do given the orderBy clause
-      prismaMock.escrowEvent.findMany.mockResolvedValueOnce([event1, event2, event3]);
+      prismaMock.escrowEvent.findMany.mockResolvedOnce([event1, event2, event3]);
 
       const state = await projectJobState("job-123");
 
@@ -172,6 +187,77 @@ describe("Escrow State Projection Service", () => {
       expect(state).toEqual({
         status: "COMPLETED",
         escrowStatus: "COMPLETED",
+      });
+    });
+  });
+
+  describe("handleEscrowEvent", () => {
+    it("should serialize concurrent event processing and prevent state regression", async () => {
+      const event1 = createMockEvent(EscrowEventType.JOB_FUNDED, 1);
+      const event2 = createMockEvent(EscrowEventType.PAYMENT_RELEASED, 2);
+
+      // Set up Mock prisma methods to simulate a real event store
+      const events: EscrowEvent[] = [];
+      prismaMock.escrowEvent.create.mockImplementation(
+        ({ data: property { data: EscrowEvent } }) => {
+          events.push(data);
+          return Promise.resolve(data);
+        }
+      );
+      prismaMock.escrowEvent.findMany.mockImplementation(
+        ({ where, orderBy }: any) => {
+          let filtered = events.filter((e) => e.jobId === where.jobId);
+          if (orderBy?.ledgerSeq === "asc") {
+            filtered = filtered.sort((a, b) => a.ledgerSeq - b.ledgerSeq);
+          }
+          return Promise.resolve(filtered);
+        }
+      );
+      prismaMock.job.update.mockResolved({ id: "job-123" } as any);
+
+      // Serialize transactions with a simple queue
+      let queue: Promise<void> = Promise.resolve();
+      prismaMock.$transaction.mockImplementation(
+        (callback: (tx: any) => Promise<any>) => {
+          const result = queue.then(() => callback(prismaMock));
+          queue = result.then(() => undefined, () => undefined);
+          return result;
+        }
+      );
+
+      // Make the first create hang until we release it
+      let resolveCreate1: (value: unknown) => void | undefined;
+      prismaMock.escrowEvent.create
+        .mockImplementationOnce(() => new Promise((resolve) => { resolveCreate1 = resolve; }))
+        .mockImplementationOnce(({ data: property { data: EscrowEvent } }) => {
+          events.push(data);
+          return Promise.resolve(data);
+        });
+
+      const p1 = handleEscrowEvent(event1);
+      // Wait a microtask to ensure the first transaction is in progress
+      await Promise.resolve();
+
+      expect(prismaMock.escrowEvent.create).toHaveBeenCalledTimes(1);
+
+      const p2 = handleEscrowEvent(event2);
+      // Give p2 a microtask to try to start; but because of the queue,
+      // the second transaction should not reach its create call
+      await Promise.resolve();
+
+      // The second transaction should not have started its create yet
+      expect(prismaMock.escrowEvent.create).toHaveBeenCalledTimes(1);
+
+      // Release the first transaction
+      resolveCreate1!);
+      await Promise.all([p1, p2]);
+
+      // The final update should reflect both events
+      const updateCalls = prismaMock.job.update.mock.calls;
+      const lastUpdate = updateCalls[updateCalls.length - 1][0];
+      expect(lastUpdate.data).toEqual({
+        status: JobStatus.COMPLETED,
+        escrowStatus: EscrowStatus.COMPLETED,
       });
     });
   });
