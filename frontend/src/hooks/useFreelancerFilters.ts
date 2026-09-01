@@ -53,6 +53,12 @@ export function useFreelancerFilters() {
     setDebouncedSearch(filtersFromUrl.search);
   }, [filtersFromUrl]);
 
+  useEffect(() => {
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, []);
+
   const syncToUrl = useCallback(
     (next: FreelancerFilters) => {
       const qs = filtersToParams(next).toString();
