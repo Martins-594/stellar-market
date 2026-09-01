@@ -1,5 +1,7 @@
 import { rpc, scValToNative } from "@stellar/stellar-sdk";
+import { randomUUID } from "node:crypto";
 import { PrismaClient, BadgeTier, EscrowEventType } from "@prisma/client";
+import Redis from "ioredis";
 import { config } from "../config";
 import { NotificationService } from "./notification.service";
 import { logger } from "../lib/logger";
@@ -19,6 +21,52 @@ const MAX_EVENTS_PER_POLL = 200;
 const SYNC_STATE_ID = "default";
 const CURSOR_ID = 1;
 const MAX_EVENT_RETRIES = 3;
+
+const HORIZON_LISTENER_LOCK_KEY = "horizon-listener:lock";
+const HORIZON_LISTENER_LOCK_TTL_MS = 30_000;
+const HORIZON_LISTENER_LOCK_RENEW_INTERVAL_MS = HORIZON_LISTENER_LOCK_TTL_MS / 3;
+const redis = new Redis(config.redisUrl);
+
+async function releaseHorizonListenerLock(token: string): Promise<void> {
+  await redis.eval(
+    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+    1,
+    HORIZON_LISTENER_LOCK_KEY,
+    token,
+  );
+}
+
+async function acquireHorizonListenerLock(): Promise<(() => Promise<void>) | null> {
+  const token = randomUUID();
+  const acquired = await redis.set(
+    HORIZON_LISTENER_LOCK_KEY,
+    token,
+    "PX",
+    HORIZON_LISTENER_LOCK_TTL_MS,
+    "NX",
+  );
+  if (acquired !== "OK") return null;
+
+  const renewal = setInterval(() => {
+    redis
+      .eval(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end",
+        1,
+        HORIZON_LISTENER_LOCK_KEY,
+        token,
+        HORIZON_LISTENER_LOCK_TTL_MS,
+      )
+      .catch((err: unknown) => {
+        logger.warn({ err }, "[HorizonListener] Failed to renew horizon listener lock");
+      });
+  }, HORIZON_LISTENER_LOCK_RENEW_INTERVAL_MS);
+  renewal.unref();
+
+  return async () => {
+    clearInterval(renewal);
+    await releaseHorizonListenerLock(token);
+  };
+}
 
 // ─── Circuit Breaker instance ─────────────────────────────────────────────────
 
@@ -416,6 +464,27 @@ async function poll(): Promise<void> {
     return;
   }
 
+  let release: (() => Promise<void>) | null;
+  try {
+    release = await acquireHorizonListenerLock();
+  } catch (err) {
+    logger.error({ err }, "[HorizonListener] Failed to acquire horizon listener lock");
+    return;
+  }
+
+  if (!release) {
+    logger.debug("[HorizonListener] Horizon listener lock not acquired — skipping poll");
+    return;
+  }
+
+  try {
+    await pollWithLock();
+  } finally {
+    await release();
+  }
+}
+
+async function pollWithLock(): Promise<void> {
   const contractIds = [
     config.stellar.escrowContractId,
     config.stellar.disputeContractId,
